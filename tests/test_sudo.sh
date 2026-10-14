@@ -21,7 +21,8 @@ test_jobs_run_as_nobody() {
     submit c1 "id -un -cores 1 -ram 64 -time 5 -prio 2" > /dev/null
     expect "$T/c1.log" "Job 1 COMPLETED" "id ran"
     send c1 "logs 1"
-    expect "$T/c1.log" "^nobody$" "the job ran as nobody"
+    # The output can follow the "client> " prompt on the same line.
+    expect "$T/c1.log" "(^|> )nobody$" "the job ran as nobody"
 }
 
 test_cannot_write_outside_job_dir() {

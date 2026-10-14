@@ -81,6 +81,8 @@ typedef struct job {
     uint64_t    start_ms, end_ms;
     int         eff_prio_logged;  /* last effective priority we logged */
     int         attempts;         /* starts that count against MAX_JOB_ATTEMPTS */
+    int         run;              /* bumped on every start; reports carry it, so a
+                                     late report from an earlier run is ignored */
     char        reason[256];      /* why it failed / was cancelled */
     int         exit_code;        /* -1 if killed by a signal */
     int         term_signal;

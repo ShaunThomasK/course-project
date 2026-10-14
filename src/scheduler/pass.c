@@ -191,6 +191,8 @@ static void dispatch(job_t *j, worker_t *w)
     }
     j->worker_id = w->id;
     j->attempts++;
+    j->run++;
+    msg_set_long(m, "run", j->run);
     j->rss_kb = j->peak_rss_kb = j->page_faults = 0;
     j->cpu_s = 0;
     char why[64];

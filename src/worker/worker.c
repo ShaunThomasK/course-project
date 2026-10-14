@@ -259,29 +259,41 @@ static void pump_output(wjob_t *j, int all)
             return;
         msg_t *m = msg_new("JOB_OUTPUT");
         msg_set_long(m, "job", j->id);
+        msg_set_long(m, "run", j->run);
         msg_take_blob(m, data, len);
         send_msg(m);
     } while (all);
 }
 
-static void report_failure_to_start(int id, const char *why)
+static void report_failure_to_start(int id, int run, const char *why)
 {
     log_line("[ERROR] Job %d Failed. Diagnosis: %s.", id, why);
     msg_t *m = msg_new("JOB_DONE");
     msg_set_long(m, "job", id);
+    msg_set_long(m, "run", run);
     msg_set(m, "result", "FAILED");
     msg_set(m, "reason", why);
     send_msg(m);
 }
 
-static void handle_run_job(msg_t *m)
+/* Starts a job. Returns 1 if it kept m for later (caller must not free it). */
+static int handle_run_job(msg_t *m)
 {
     int id = (int)msg_get_long(m, "job", 0);
+    int run = (int)msg_get_long(m, "run", 0);
+    wjob_t *old = find_job(id);
+    if (old && old->run != run && !old->next_run) {
+        /* An earlier run of this job is still being killed (preemption or
+         * migration brought it straight back here). Start once it's gone. */
+        log_line("Job %d ASSIGNED again; waiting for the previous run to exit first", id);
+        old->next_run = m;
+        return 1;
+    }
     log_line("Job %d ASSIGNED, forking... (%s, %lldMB, %llds)", id, msg_get_str(m, "path"),
              msg_get_long(m, "ram", 0), msg_get_long(m, "time", 0));
-    if (find_job(id)) {
-        report_failure_to_start(id, "Worker is already running this job");
-        return;
+    if (old) {
+        report_failure_to_start(id, run, "Worker is already running this job");
+        return 0;
     }
     wjob_t *j = calloc(1, sizeof(*j));
     if (!j)
@@ -290,18 +302,19 @@ static void handle_run_job(msg_t *m)
         char why[128];
         snprintf(why, sizeof(why), "Worker could not fork: %s", strerror(errno));
         free(j);
-        report_failure_to_start(id, why);
-        return;
+        report_failure_to_start(id, run, why);
+        return 0;
     }
     g_jobs = realloc(g_jobs, sizeof(wjob_t *) * (size_t)(g_njobs + 1));
     g_jobs[g_njobs++] = j;
     log_line("Job %d RUNNING (pid %d, dir %s)", j->id, (int)j->pid, j->dir);
+    return 0;
 }
 
 static void handle_kill_job(msg_t *m)
 {
     wjob_t *j = find_job((int)msg_get_long(m, "job", 0));
-    if (!j)
+    if (!j || msg_get_long(m, "run", j->run) != j->run)
         return; /* already finished */
     const char *reason = msg_get_str(m, "reason");
     kill_reason_t why = KILL_CANCEL;
@@ -321,7 +334,7 @@ static void finish_job(wjob_t *j)
     char reason[300];
     int ok = jobrun_diagnose(j, reason, sizeof(reason));
 
-    if (j->killed == KILL_CANCEL)
+    if (j->killed == KILL_CANCEL || j->killed == KILL_PREEMPT || j->killed == KILL_MIGRATE)
         log_line("Job %d killed and reaped (%s).", j->id, reason);
     else if (ok)
         log_line("Job %d COMPLETED (exit code 0, peak RAM %ldMB, CPU %.1fs)", j->id,
@@ -329,9 +342,20 @@ static void finish_job(wjob_t *j)
     else
         log_line("[ERROR] Job %d Failed. Diagnosis: %s.", j->id, reason);
 
+    static const char *kill_names[] = {
+        [KILL_CANCEL] = "cancel", [KILL_PREEMPT] = "preempt", [KILL_MIGRATE] = "migrate",
+    };
+    int requested = j->killed == KILL_CANCEL || j->killed == KILL_PREEMPT ||
+                    j->killed == KILL_MIGRATE;
+
     msg_t *m = msg_new("JOB_DONE");
     msg_set_long(m, "job", j->id);
-    msg_set(m, "result", ok ? "COMPLETED" : "FAILED");
+    msg_set_long(m, "run", j->run);
+    /* KILLED = stopped because the scheduler asked; the scheduler decides
+     * what happens next (cancelled, requeued ...). */
+    msg_set(m, "result", requested ? "KILLED" : ok ? "COMPLETED" : "FAILED");
+    if (requested)
+        msg_set(m, "killed", kill_names[j->killed]);
     msg_set(m, "reason", ok ? "" : reason);
     if (WIFEXITED(j->status))
         msg_set_long(m, "exit_code", WEXITSTATUS(j->status));
@@ -344,7 +368,10 @@ static void finish_job(wjob_t *j)
 
     /* Output and report are out; the job directory can go. */
     jobrun_cleanup(j);
+    msg_t *next = j->next_run;
     remove_job(j);
+    if (next && !handle_run_job(next))
+        msg_free(next);
 }
 
 static void tick_jobs(int sample)
@@ -380,6 +407,7 @@ static void kill_all_jobs(void)
         if (j->err_fd >= 0)
             close(j->err_fd);
         jobrun_cleanup(j);
+        msg_free(j->next_run);
         remove_job(j);
     }
 }
@@ -500,9 +528,9 @@ int main(int argc, char **argv)
                 msg_t *m;
                 int got;
                 while ((got = conn_next(&g_conn, &m)) == 1) {
-                    if (msg_is(m, "RUN_JOB"))
-                        handle_run_job(m);
-                    else if (msg_is(m, "KILL_JOB"))
+                    if (msg_is(m, "RUN_JOB") && handle_run_job(m))
+                        continue; /* kept for later */
+                    if (msg_is(m, "KILL_JOB"))
                         handle_kill_job(m);
                     msg_free(m);
                 }

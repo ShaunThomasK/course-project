@@ -316,6 +316,7 @@ static void handle_cancel(peer_t *p, msg_t *m)
         if (w && w->peer) {
             msg_t *k = msg_new("KILL_JOB");
             msg_set_long(k, "job", j->id);
+            msg_set_long(k, "run", j->run);
             msg_set(k, "reason", "cancel");
             msg_set(k, "by", p->user);
             peer_send(w->peer, k);
@@ -396,7 +397,8 @@ static void handle_job_done(worker_t *w, msg_t *m)
     j->page_faults = msg_get_long(m, "faults", j->page_faults);
     j->cpu_s = (double)msg_get_long(m, "cpu_ms", 0) / 1000.0;
 
-    if (j->state != JOB_RUNNING || j->worker_id != w->id) {
+    if (j->state != JOB_RUNNING || j->worker_id != w->id ||
+        msg_get_long(m, "run", j->run) != j->run) {
         log_line("Job %d: final report from Worker %d noted (job is %s)", j->id, w->id,
                  job_state_name(j->state));
         return;
@@ -426,7 +428,8 @@ static void handle_worker_msg(peer_t *p, msg_t *m)
         handle_heartbeat(w, m);
     } else if (msg_is(m, "JOB_OUTPUT")) {
         job_t *j = job_find((int)msg_get_long(m, "job", 0));
-        if (j && m->blob_len)
+        /* Output of an earlier run that arrives after a new one started is dropped. */
+        if (j && m->blob_len && msg_get_long(m, "run", j->run) == j->run)
             job_append_output(j, m->blob, m->blob_len);
     } else if (msg_is(m, "JOB_DONE")) {
         handle_job_done(w, m);

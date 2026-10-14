@@ -22,6 +22,8 @@ typedef enum {
 
 typedef struct {
     int      id;
+    int      run;            /* scheduler's run number for this start */
+    msg_t   *next_run;       /* RUN_JOB for a newer run, started once this one is gone */
     pid_t    pid;
     uint64_t start_ms;
     int      time_s;

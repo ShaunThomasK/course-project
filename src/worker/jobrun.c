@@ -211,6 +211,7 @@ void jobrun_cleanup(wjob_t *j)
 int jobrun_start(wjob_t *j, const msg_t *run)
 {
     j->id = (int)msg_get_long(run, "job", 0);
+    j->run = (int)msg_get_long(run, "run", 0);
     j->time_s = (int)msg_get_long(run, "time", 1);
     j->ram_mb = msg_get_long(run, "ram", 1);
     snprintf(j->dir, sizeof(j->dir), "/tmp/osn_job_%d", j->id);

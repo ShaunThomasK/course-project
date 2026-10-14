@@ -105,6 +105,10 @@ typedef struct job {
     /* Section 10: preemption. */
     int   preemptible;
     int   held_for;               /* preempted for this job; 0 = no hold */
+    int   free_restart;           /* next start doesn't cost an attempt (10, 14) */
+
+    /* Section 11: last job we logged skipping this one in favour of. */
+    int   quota_skip_logged;
 
     /* Section 12: the cron template that spawned this job, 0 = none. */
     int   cron_id;

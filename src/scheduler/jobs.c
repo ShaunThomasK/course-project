@@ -247,6 +247,10 @@ void job_render_status(job_t *j, buf_t *out)
     bprintf(out, "  - Attempts: %d of %d\n", j->attempts, MAX_JOB_ATTEMPTS);
     if (j->group)
         bprintf(out, "  - Group: %d\n", j->group);
+    if (j->preemptible)
+        bprintf(out, "  - Preemptible: yes\n");
+    if (j->held_for && j->state == JOB_QUEUED)
+        bprintf(out, "  - Preempted; held until Job %d starts\n", j->held_for);
     if (j->ndeps) {
         bprintf(out, "  - Depends on:");
         for (int i = 0; i < j->ndeps; i++) {

@@ -266,8 +266,8 @@ static void handle_submit(peer_t *p, msg_t *m)
         reply(p, 0, "%s", bad);
         return;
     }
-    if (msg_get(m, "every") || msg_get(m, "preemptible")) {
-        reply(p, 0, "-preemptible and -every are not supported yet.");
+    if (msg_get(m, "every")) {
+        reply(p, 0, "-every is not supported yet.");
         return;
     }
 

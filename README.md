@@ -261,34 +261,41 @@ replies `OSN_SCHEDULER <nonce> <tcp_port>`, and the source address of that
 reply is the scheduler's IP. The asker makes 3 attempts with a 2 s wait each,
 then falls back to the command-line address.
 
-## Testing notes
+## Testing
+
+An automated suite lives in `tests/`. Each test starts a fresh scheduler,
+workers and clients on random ports. It types commands into them through
+FIFOs, and checks their logs.
+
+```sh
+tests/run_all.sh                 # build, then run every test file
+tests/run_all.sh cache           # only tests whose name contains "cache"
+tests/test_m2_resilience.sh drain   # one file, filtered
+sudo tests/test_sudo.sh          # privilege dropping and limits (needs root)
+sudo tests/run_all.sh            # everything, including test_sudo.sh
+```
+
+Build as yourself first (`make all tests`) before using `sudo`.
+
+| File | Covers |
+|---|---|
+| `test_m1_core.sh` | startup and log format, discovery and fallback, UDP port reuse, clamping, username rules, job args and logs, PATH commands, submit validation, every crash diagnosis, wall-clock and memory limits, FIFO blocking, PRIORITY order and aging, QUEUE_FULL, nodes/status, load-aware choice, GPUs |
+| `test_m2_resilience.sh` | events at an idle prompt and only to the owner, two sessions with one name, live `logs -f`, Ctrl+C while following, 64 KB log tail, RAM telemetry, cancel (no zombies), SUSPECTED and recovery, DEAD and rescue, FAILED_PERMANENT, DEAD worker re-registering, drain via stdin and Ctrl+C, scheduler restart, reconnecting mid-follow, events while typing in a real terminal |
+| `test_m3_scheduling.sh` | dependency chains, groups resolved at submit time, dependency errors, cascading cancels, preemption victim order and no attempt cost, quota example and the 50% boundary, cron |
+| `test_m3_cache.sh` | the whole Section 13 checklist: hit/miss, changed byte, deleted cache file, worker restart, preferring the cached worker, idle beats cached, A, B, A, C eviction with a 2 MB cache, a 30 MB binary |
+| `test_m4_checkpoint.sh` | migrate and resume, migrate with one worker, errors, no checkpoint, SIGKILL after an ignored SIGTERM, resume after kill -9 and after preemption |
+| `test_sudo.sh` | jobs run as nobody, can't write outside the job dir, job dir ownership and cleanup, fork bomb capped by RLIMIT_NPROC, SIGXCPU from RLIMIT_CPU, RLIMIT_AS, checkpoints and cache as nobody |
 
 The test programs in `tests/programs/` are built by `make tests`:
 * `counter`: checkpoints its progress and resumes from it
-* `big_a`, `big_b`, `big_c`: three ~0.7 MB programs with different hashes,
-  for the cache-limit check
-* the rest are for limits, crashes and streaming
+* `big_a`, `big_b`, `big_c`: three ~0.7 MB programs with different hashes
+* `cpu_hog`: spins 4 threads, to trip RLIMIT_CPU
+* `forkbomb`: a bounded fork bomb, for RLIMIT_NPROC
+* `ignore_term`: ignores SIGTERM, for migration's SIGKILL fallback
+* `escape_attempt`: tries to write outside its directory
+* the rest are for crashes, limits and streaming
 
-Tested so far on Linux, without root:
-* discovery and the fallback address
-* binary transfer, PATH commands and program arguments
-* streaming `logs -f`
-* the timeout, SIGSEGV, SIGFPE and exit-127 diagnoses
-* RAM telemetry climbing
-* worker kill -9 → SUSPECTED → DEAD → rescue as attempt 2
-* SIGSTOP → SUSPECTED → ALIVE
-* drain
-* cancelling a queued and a running job
-* priority aging order
-* QUEUE_FULL at 1024
-* clients and workers reconnecting after a scheduler restart
-* dependency chains, groups and cascading cancels
-* preemption order and resume from checkpoint
-* the Section 11 quota example
-* cron injection and cancel-cron
-* every "How to check it" item of Section 13, including the A, B, A, C
-  eviction with a 2 MB cache
-* migrate, and resuming from a checkpoint after kill -9
+Paths with spaces: the client splits commands on spaces, so quote such a path,
+for example `submit "/home/me/Course Work/prog" -cores 1 ...`.
 
-Still to test: running under `sudo` (`escape_attempt` should get "Permission
-denied" outside its job directory) and macOS.
+Not covered: macOS, and several machines on one network.

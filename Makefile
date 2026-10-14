@@ -35,7 +35,7 @@ tests/programs/bin/big_%: tests/programs/bigprog.c
 
 tests/programs/bin/%: tests/programs/%.c
 	@mkdir -p tests/programs/bin
-	$(CC) -O0 -g -o $@ $<
+	$(CC) -O0 -g -pthread -o $@ $<
 
 clean:
 	rm -f scheduler worker client

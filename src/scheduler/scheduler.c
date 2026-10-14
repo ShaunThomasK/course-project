@@ -182,6 +182,11 @@ static void handle_submit(peer_t *p, msg_t *m)
         reply(p, 0, "Invalid submit: need a binary, -cores >= 1, -ram >= 1, -time >= 1, -prio 1-3, -gpu >= 0.");
         return;
     }
+    if (msg_get(m, "depends-on") || msg_get(m, "group") || msg_get(m, "every") ||
+        msg_get(m, "preemptible")) {
+        reply(p, 0, "-depends-on, -group, -preemptible and -every are not supported yet.");
+        return;
+    }
     if (strlen(path) >= PATH_MAX) {
         reply(p, 0, "Binary path is too long.");
         return;
@@ -323,7 +328,7 @@ static void handle_cancel(peer_t *p, msg_t *m)
     snprintf(j->reason, sizeof(j->reason), "Cancelled by %s", p->user);
     job_set_state(j, JOB_CANCELLED, why);
 
-    reply(p, 1, "Job %d cancelled.", j->id);
+    reply(p, 1, "[Client] Job %d cancelled.", j->id);
     notify_user(j->user, "Job %d %s -> CANCELLED (requested by %s).", j->id,
                 job_state_name(from), p->user);
 }
@@ -406,8 +411,8 @@ static void handle_job_done(worker_t *w, msg_t *m)
         notify_user(j->user, "Job %d COMPLETED successfully.", j->id);
     } else {
         job_set_state(j, JOB_FAILED, j->reason);
-        log_line("[ERROR] Job %d Failed. Diagnosis: %s", j->id, j->reason);
-        notify_user(j->user, "Job %d FAILED. Reason: %s", j->id, j->reason);
+        log_line("[ERROR] Job %d Failed. Diagnosis: %s.", j->id, j->reason);
+        notify_user(j->user, "Job %d FAILED. Reason: %s.", j->id, j->reason);
     }
 }
 

@@ -182,6 +182,13 @@ static void dispatch(job_t *j, worker_t *w)
         }
     }
 
+    if (j->out_total > 0) {
+        /* Earlier attempts' output stays; mark where this one starts. */
+        char mark[96];
+        int n = snprintf(mark, sizeof(mark), "\n--- attempt %d on Worker %d ---\n",
+                         j->attempts + 1, w->id);
+        job_append_output(j, mark, (size_t)n);
+    }
     j->worker_id = w->id;
     j->attempts++;
     j->rss_kb = j->peak_rss_kb = j->page_faults = 0;

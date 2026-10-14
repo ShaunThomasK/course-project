@@ -138,6 +138,9 @@ static int login(void)
 
 static void ask_username(void)
 {
+    /* Unbuffered, so fgets() never swallows lines meant for the prompt
+     * loop, which reads stdin with read(). */
+    setvbuf(stdin, NULL, _IONBF, 0);
     char line[256];
     for (;;) {
         fputs("Username: ", stdout);

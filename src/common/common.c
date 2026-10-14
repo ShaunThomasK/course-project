@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 const char *job_state_name(job_state_t s)
 {
@@ -85,6 +86,37 @@ int parse_long(const char *s, long *out)
 }
 
 static char g_log_tag[64] = "?";
+static char g_prompt[32]; /* "" = no prompt */
+
+static void clear_prompt_at_exit(void)
+{
+    if (g_prompt[0]) {
+        fputs("\r\033[K", stdout);
+        fflush(stdout);
+    }
+}
+
+void log_set_prompt(const char *prompt)
+{
+    static int registered;
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+        return;
+    str_copy(g_prompt, prompt, sizeof(g_prompt));
+    if (!registered) {
+        atexit(clear_prompt_at_exit);
+        registered = 1;
+    }
+    log_show_prompt();
+}
+
+void log_show_prompt(void)
+{
+    if (!g_prompt[0])
+        return;
+    fputs("\r\033[K", stdout);
+    fputs(g_prompt, stdout);
+    fflush(stdout);
+}
 
 void log_set_tag(const char *fmt, ...)
 {
@@ -110,7 +142,11 @@ void log_line(const char *fmt, ...)
     vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
     va_end(ap);
 
+    if (g_prompt[0])
+        fputs("\r\033[K", stdout); /* the line under the cursor is the prompt */
     fputs(line, stdout);
     fputc('\n', stdout);
+    if (g_prompt[0])
+        fputs(g_prompt, stdout);
     fflush(stdout);
 }

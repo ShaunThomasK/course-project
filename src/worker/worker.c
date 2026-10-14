@@ -603,6 +603,8 @@ static void handle_stdin(void)
                          (double)(now_ms() - g_jobs[i]->start_ms) / 1000.0);
         } else if (*cmd) {
             log_line("Unknown command '%s'. Commands: drain, jobs", cmd);
+        } else {
+            log_show_prompt(); /* just Enter */
         }
         size_t consumed = (size_t)(nl - line) + 1;
         memmove(line, nl + 1, used - consumed);
@@ -633,6 +635,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "worker: could not find or reach a scheduler. Exiting.\n");
         return 1;
     }
+    log_set_prompt("worker> "); /* local admin commands (Section 9) */
 
     uint64_t last_hb = now_ms(), last_sample = now_ms();
     send_heartbeat();

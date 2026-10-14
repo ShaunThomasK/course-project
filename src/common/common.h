@@ -78,4 +78,11 @@ void log_set_tag(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* The single central logging function: "[HH:MM:SS] [TAG] message". */
 void log_line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* An input prompt (e.g. "worker> ") that log_line() keeps at the bottom:
+ * each log line clears it, prints, and draws it again. Only takes effect
+ * when stdin and stdout are a terminal. The prompt is cleared at exit. */
+void log_set_prompt(const char *prompt);
+/* Redraws the prompt, e.g. after the user pressed Enter on an empty line. */
+void log_show_prompt(void);
+
 #endif

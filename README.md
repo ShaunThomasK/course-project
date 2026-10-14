@@ -22,9 +22,17 @@ sudo ./worker -cores 4 -ram 2048 -gpu 1   # [<ip> <port>] fallback, [-discovery-
 Without `sudo` the worker warns and runs jobs as you. It skips the `chown` and
 the `setuid`, so you can develop without root.
 
-Client commands: `nodes`, `submit <binary> [args...] -cores N -ram MB -time SEC
--prio 1-3 [-gpu N]`, `status <id>`, `logs <id> [-f]`, `cancel <id>`, `help`,
-`exit`.
+Client commands:
+* `nodes`
+* `submit <binary> [args...] -cores N -ram MB -time SEC -prio 1-3 [-gpu N]
+  [-depends-on 1,2,g3] [-group N] [-preemptible] [-every SEC]`
+* `status <id>`, `logs <id> [-f]`, `cancel <id>`, `migrate <id>`
+* `crons`, `cancel-cron <id>`
+* `help`, `exit`
+
+Worker environment variables: `OSN_CACHE_DIR` (default `cache/`) and
+`OSN_CACHE_SIZE_MB` (default 512). Give each worker on one machine its own
+cache folder.
 
 On the worker, type `drain` (or press Ctrl+C) to finish the current jobs and
 leave the cluster. `jobs` lists what is running.
@@ -35,8 +43,8 @@ leave the cluster. `jobs` lists what is running.
 |---|---|---|
 | 1 Core pipeline | 2, 3, 4A-B, 5A-B, 7 | done |
 | 2 Resilience & telemetry | 4C-D, 5C-E, 6, 9 | done |
-| 3 Advanced scheduling | 8, 10, 11, 12, 13 | not started (state machine and fields already in place) |
-| 4 Checkpoints & migration | 14 | not started (`checkpoint/` dir and `OSN_CHECKPOINT_DIR` already set up) |
+| 3 Advanced scheduling | 8, 10, 11, 12, 13 | done |
+| 4 Checkpoints & migration | 14 | done |
 
 ## Design
 
@@ -46,11 +54,15 @@ leave the cluster. `jobs` lists what is running.
 src/common/    common.c     state enums, log_line(), small helpers
                proto.c      message framing, buffered connections, sockets
                discovery.c  UDP discovery (client side and responder)
+               sha256.c     SHA-256 for identifying binaries
 src/scheduler/ scheduler.c  event loop, connections, request handlers, heartbeats
-               jobs.c       job state transitions, log buffers, status/nodes text
-               pass.c       the scheduling pass and worker choice
-src/worker/    worker.c     connection, heartbeats, drain, main loop
+               jobs.c       job state transitions, dependencies, status/nodes text
+               pass.c       the scheduling pass: hold, quota, match, choose,
+                            preemption, binary hashes, RUN_JOB
+               cron.c       recurring job templates
+src/worker/    worker.c     connection, heartbeats, drain, checkpoints, main loop
                jobrun.c     fork/limits/exec, output capture, telemetry, diagnosis
+               cache.c      executable cache with LRU size limit
 src/client/    client.c     prompt, commands, async events
 ```
 
@@ -116,6 +128,81 @@ that is `nobody`, so all jobs on a worker share the budget of 64. Without
 job that forks will fail during development. Single-process jobs are
 unaffected.
 
+### Run numbers
+
+Every start of a job gets a new run number. The number travels in
+`RUN_JOB`, and the worker echoes it on every report about that run.
+
+This matters because preemption and migration put a RUNNING job back in the
+queue while its old process is still dying. The next start can even land on
+the same worker. The scheduler ignores reports whose run number is stale. If
+a newer `RUN_JOB` reaches a worker before the old run has exited, the worker
+holds it until the old run is reaped and its directory is removed.
+
+### Dependencies (8)
+
+A job with `-depends-on` starts WAITING and is not part of the pass. A group
+like `g3` is resolved at submit time, into the jobs in group 3 at that moment.
+
+Whenever a job reaches a final state, the jobs waiting on it are re-checked.
+If every dependency is COMPLETED, they move to QUEUED. If any dependency
+FAILED, hit FAILED_PERMANENT or was CANCELLED, they are CANCELLED too. That
+cancellation is itself a final state, so it cascades down the chain.
+
+### Preemption (10) and quotas (11)
+
+These are steps of the pass in `pass.c`, in the order the spec fixes:
+1. hold
+2. quota
+3. match
+4. choose
+5. no match: preemption, then FIFO stop or PRIORITY skip
+
+A priority 1 job here means one *submitted* with `-prio 1`. A job that only
+aged to priority 1 does not preempt anything.
+
+Preemption looks for the worker where killing preemptible jobs frees enough
+room, and picks the one that needs the fewest victims. Victims are chosen
+lowest priority first, then newest first, and only as many as needed. They
+return to QUEUED without using an attempt.
+
+The quota counts the cores held by each user's RUNNING jobs, out of all
+workers that aren't DEAD. A skipped job is logged only when the job it is
+skipped for changes, so the log isn't flooded on every tick.
+
+### Executable caching (13)
+
+The scheduler hashes binaries with SHA-256. It remembers each path's hash,
+keyed by inode, size and mtime, so a big file isn't re-hashed on every
+decision. It also tracks which hashes each worker holds.
+
+The worker checks the hash of every file it receives, then stores it in
+`<cache>/<name>-<sha256>` (via a temp file and `rename()`). The job copies it
+from there into its own directory.
+
+LRU order is kept in the files' mtimes: a file is touched when it is stored
+and every time a job starts from it, so the order survives a restart.
+
+When the cache goes over its limit, the worker evicts least-recently-used
+files. It never evicts the file just stored or one a running job uses. Then
+it sends `CACHE_STATE` so the scheduler knows what is left.
+
+A cached file that has gone missing triggers `CACHE_MISS`. The scheduler
+resends the full file for the same run, which doesn't use an attempt.
+
+### Checkpoints and migration (14)
+
+The worker watches `checkpoint/state` every 500 ms, using `stat()`
+timestamps, size and content. It checks once more when the job exits, which
+catches the checkpoint written in response to SIGTERM.
+
+Any restart of a job sends `RESTORE_CKPT` just before `RUN_JOB`. That covers
+migration, preemption, and a dead worker. The worker writes the saved
+checkpoint into the new job directory before `exec`.
+
+`migrate` sends SIGTERM, then SIGKILL 2 s later. The job is requeued only
+once the worker confirms it stopped, so its final checkpoint is never lost.
+
 ### Two clients with the same name
 
 Both sessions are accepted. They count as the same user: both see that user's
@@ -144,22 +231,28 @@ blob is raw bytes: an executable, a chunk of output, a checkpoint.
 |---|---|---|
 | client → sched | `LOGIN` | `user` |
 | sched → client | `LOGIN_OK` | `user` |
-| client → sched | `SUBMIT` | `path argc arg0.. cores ram time prio gpu` |
+| client → sched | `SUBMIT` | `path argc arg0.. cores ram time prio gpu [depends-on group preemptible every]` |
 | client → sched | `STATUS` / `CANCEL` | `job` |
 | client → sched | `NODES` | |
+| client → sched | `MIGRATE` | `job` |
+| client → sched | `CRONS` / `CANCEL_CRON` | `cron` |
 | client → sched | `LOGS` | `job follow` |
 | client → sched | `UNFOLLOW` | `job` |
-| sched → client | `REPLY` | `ok text` (+ `job`, or `code=QUEUE_FULL`) |
+| sched → client | `REPLY` | `ok text` (+ `job state waiting_on`, `cron every`, or `code=QUEUE_FULL`) |
 | sched → client | `EVENT` | `text` |
 | sched → client | `LOG_DATA` | `job [truncated]`, blob = output |
 | sched → client | `LOG_END` | `job state` |
-| worker → sched | `REGISTER` | `cores ram gpu host` |
+| worker → sched | `REGISTER` | `cores ram gpu host cached=hash,hash,...` |
 | sched → worker | `REGISTER_OK` | `id` |
 | worker → sched | `HEARTBEAT` | `load jobs tele=id:rss_kb:peak_kb:faults:cpu_ms;...` |
-| sched → worker | `RUN_JOB` | `job path argc arg0.. cores ram time gpu [binary=1]`, blob = executable |
-| sched → worker | `KILL_JOB` | `job reason by` |
-| worker → sched | `JOB_OUTPUT` | `job`, blob = output chunk |
-| worker → sched | `JOB_DONE` | `job result reason exit_code signal peak_kb faults cpu_ms` |
+| sched → worker | `RESTORE_CKPT` | `job run num`, blob = checkpoint (sent before `RUN_JOB`) |
+| sched → worker | `RUN_JOB` | `job run path argc arg0.. cores ram time gpu [binary=1 hash cached=1]`, blob = executable unless cached |
+| sched → worker | `KILL_JOB` | `job run reason=cancel/preempt/migrate by` |
+| worker → sched | `JOB_OUTPUT` | `job run`, blob = output chunk |
+| worker → sched | `CHECKPOINT` | `job run`, blob = checkpoint |
+| worker → sched | `JOB_DONE` | `job run result=COMPLETED/FAILED/KILLED killed reason exit_code signal peak_kb faults cpu_ms` |
+| worker → sched | `CACHE_STATE` | `cached=hash,...` (after evictions) |
+| worker → sched | `CACHE_MISS` | `job run hash` |
 | worker → sched | `DRAIN` | |
 
 Discovery is UDP. The asker sends `OSN_DISCOVER <nonce>` to 255.255.255.255,
@@ -169,6 +262,12 @@ reply is the scheduler's IP. The asker makes 3 attempts with a 2 s wait each,
 then falls back to the command-line address.
 
 ## Testing notes
+
+The test programs in `tests/programs/` are built by `make tests`:
+* `counter`: checkpoints its progress and resumes from it
+* `big_a`, `big_b`, `big_c`: three ~0.7 MB programs with different hashes,
+  for the cache-limit check
+* the rest are for limits, crashes and streaming
 
 Tested so far on Linux, without root:
 * discovery and the fallback address
@@ -183,6 +282,13 @@ Tested so far on Linux, without root:
 * priority aging order
 * QUEUE_FULL at 1024
 * clients and workers reconnecting after a scheduler restart
+* dependency chains, groups and cascading cancels
+* preemption order and resume from checkpoint
+* the Section 11 quota example
+* cron injection and cancel-cron
+* every "How to check it" item of Section 13, including the A, B, A, C
+  eviction with a 2 MB cache
+* migrate, and resuming from a checkpoint after kill -9
 
 Still to test: running under `sudo` (`escape_attempt` should get "Permission
 denied" outside its job directory) and macOS.

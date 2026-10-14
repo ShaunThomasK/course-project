@@ -33,6 +33,8 @@ static void release(worker_t *w, job_t *j)
     w->running_jobs--;
 }
 
+static void release_dependents(job_t *done);
+
 void job_set_state(job_t *j, job_state_t to, const char *why)
 {
     job_state_t from = j->state;
@@ -59,8 +61,10 @@ void job_set_state(job_t *j, job_state_t to, const char *why)
     else
         log_line("Job %d %s -> %s", j->id, job_state_name(from), job_state_name(to));
 
-    if (job_state_is_terminal(to))
+    if (job_state_is_terminal(to)) {
         job_end_followers(j);
+        release_dependents(j);
+    }
     g_sched_dirty = 1;
 }
 
@@ -81,6 +85,7 @@ void job_rescue(job_t *j)
         notify_user(j->user, "Job %d FAILED_PERMANENT. Reason: worker died on all %d attempts.",
                     j->id, MAX_JOB_ATTEMPTS);
         job_end_followers(j);
+        release_dependents(j);
     } else {
         log_line("Job %d RUNNING -> LOST -> QUEUED (attempt %d of %d failed)",
                  j->id, j->attempts, MAX_JOB_ATTEMPTS);
@@ -90,6 +95,86 @@ void job_rescue(job_t *j)
         notify_user(j->user, "Job %d (attempt %d) moved back to QUEUED.", j->id, j->attempts);
     }
     g_sched_dirty = 1;
+}
+
+job_t *job_create(const msg_t *m, const char *user)
+{
+    job_t *j = calloc(1, sizeof(*j));
+    if (!j)
+        abort();
+    j->id = g_njobs + 1;
+    str_copy(j->user, user, sizeof(j->user));
+    str_copy(j->path, msg_get_str(m, "path"), sizeof(j->path));
+    j->argc = (int)msg_get_long(m, "argc", 0);
+    if (j->argc < 0 || j->argc > 1024)
+        j->argc = 0;
+    j->argv = calloc((size_t)j->argc + 1, sizeof(char *));
+    for (int i = 0; i < j->argc; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "arg%d", i);
+        j->argv[i] = strdup(msg_get_str(m, key));
+    }
+    j->cores = (int)msg_get_long(m, "cores", 1);
+    j->ram_mb = msg_get_long(m, "ram", 1);
+    j->time_s = (int)msg_get_long(m, "time", 1);
+    j->prio = (int)msg_get_long(m, "prio", 3);
+    j->gpus = (int)msg_get_long(m, "gpu", 0);
+    j->group = (int)msg_get_long(m, "group", 0);
+    j->preemptible = msg_get_long(m, "preemptible", 0) != 0;
+    j->submit_ms = j->queued_ms = now_ms();
+    j->eff_prio_logged = j->prio;
+    j->exit_code = -1;
+    j->state = JOB_QUEUED;
+
+    g_jobs = realloc(g_jobs, sizeof(job_t *) * (size_t)(g_njobs + 1));
+    g_jobs[g_njobs++] = j;
+    g_sched_dirty = 1;
+    return j;
+}
+
+int job_check_deps(job_t *j)
+{
+    if (j->state != JOB_WAITING)
+        return 0;
+    int all_done = 1;
+    for (int i = 0; i < j->ndeps; i++) {
+        job_t *d = job_find(j->deps[i]);
+        if (!d)
+            continue;
+        if (d->state == JOB_FAILED || d->state == JOB_FAILED_PERMANENT ||
+            d->state == JOB_CANCELLED) {
+            char why[96];
+            snprintf(why, sizeof(why), "dependency Job %d %s", d->id, job_state_name(d->state));
+            snprintf(j->reason, sizeof(j->reason), "Dependency Job %d ended %s", d->id,
+                     job_state_name(d->state));
+            notify_user(j->user, "Job %d WAITING -> CANCELLED (%s).", j->id, why);
+            job_set_state(j, JOB_CANCELLED, why); /* cascades to its own dependents */
+            return 1;
+        }
+        if (d->state != JOB_COMPLETED)
+            all_done = 0;
+    }
+    if (!all_done)
+        return 0;
+    job_set_state(j, JOB_QUEUED, "dependencies satisfied");
+    notify_user(j->user, "Job %d moved from WAITING to QUEUED (dependency satisfied).", j->id);
+    return 1;
+}
+
+/* A job just reached a final state: re-check everything waiting on it. */
+static void release_dependents(job_t *done)
+{
+    for (int i = 0; i < g_njobs; i++) {
+        job_t *j = g_jobs[i];
+        if (j->state != JOB_WAITING)
+            continue;
+        for (int k = 0; k < j->ndeps; k++) {
+            if (j->deps[k] == done->id) {
+                job_check_deps(j);
+                break;
+            }
+        }
+    }
 }
 
 void job_append_output(job_t *j, const char *data, size_t len)
@@ -160,6 +245,17 @@ void job_render_status(job_t *j, buf_t *out)
     bprintf(out, "  - Requested: %d cores, %ldMB RAM, %d GPU, %ds time limit, priority %d\n",
             j->cores, j->ram_mb, j->gpus, j->time_s, j->prio);
     bprintf(out, "  - Attempts: %d of %d\n", j->attempts, MAX_JOB_ATTEMPTS);
+    if (j->group)
+        bprintf(out, "  - Group: %d\n", j->group);
+    if (j->ndeps) {
+        bprintf(out, "  - Depends on:");
+        for (int i = 0; i < j->ndeps; i++) {
+            job_t *d = job_find(j->deps[i]);
+            bprintf(out, "%s Job %d (%s)", i ? "," : "", j->deps[i],
+                    d ? job_state_name(d->state) : "?");
+        }
+        bprintf(out, "\n");
+    }
 
     uint64_t now = now_ms();
     if (j->state == JOB_QUEUED) {

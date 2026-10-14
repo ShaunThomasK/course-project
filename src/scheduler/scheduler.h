@@ -151,6 +151,12 @@ void job_render_status(job_t *j, buf_t *out);
 void render_nodes(buf_t *out);
 /* Moves a job off a worker that died (RUNNING -> LOST -> QUEUED/FAILED_PERMANENT). */
 void job_rescue(job_t *j);
+/* Creates a job from a SUBMIT message (already validated) and adds it to
+ * the table in state QUEUED. Used by submit and by cron templates. */
+job_t *job_create(const msg_t *submit, const char *user);
+/* Section 8: WAITING -> QUEUED once all deps COMPLETED, or CANCELLED as
+ * soon as one fails. Returns 1 if j left WAITING. */
+int  job_check_deps(job_t *j);
 
 /* ---- pass.c ------------------------------------------------------------ */
 

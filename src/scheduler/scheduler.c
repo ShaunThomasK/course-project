@@ -171,76 +171,152 @@ static void check_heartbeats(void)
 
 /* ---- client requests ------------------------------------------------------ */
 
-static void handle_submit(peer_t *p, msg_t *m)
+/* Checks the fields every submit needs. Returns an error text or NULL. */
+static const char *submit_invalid(const msg_t *m)
 {
     long cores = msg_get_long(m, "cores", -1), ram = msg_get_long(m, "ram", -1);
     long tlim = msg_get_long(m, "time", -1), prio = msg_get_long(m, "prio", -1);
     long gpus = msg_get_long(m, "gpu", 0);
     const char *path = msg_get_str(m, "path");
 
-    if (!*path || cores < 1 || ram < 1 || tlim < 1 || prio < 1 || prio > 3 || gpus < 0) {
-        reply(p, 0, "Invalid submit: need a binary, -cores >= 1, -ram >= 1, -time >= 1, -prio 1-3, -gpu >= 0.");
+    if (!*path || cores < 1 || ram < 1 || tlim < 1 || prio < 1 || prio > 3 || gpus < 0)
+        return "Invalid submit: need a binary, -cores >= 1, -ram >= 1, -time >= 1, -prio 1-3, -gpu >= 0.";
+    if (strlen(path) >= PATH_MAX)
+        return "Binary path is too long.";
+    const char *g = msg_get(m, "group");
+    long gv;
+    if (g && (parse_long(g, &gv) < 0 || gv < 1))
+        return "-group needs a positive integer.";
+    return NULL;
+}
+
+static int group_exists(int group)
+{
+    for (int i = 0; i < g_njobs; i++)
+        if (g_jobs[i]->group == group)
+            return 1;
+    return 0;
+}
+
+static void add_dep(int **deps, int *n, int id)
+{
+    for (int i = 0; i < *n; i++)
+        if ((*deps)[i] == id)
+            return;
+    *deps = realloc(*deps, sizeof(int) * (size_t)(*n + 1));
+    (*deps)[(*n)++] = id;
+}
+
+/*
+ * Parses "-depends-on 1,2,g3" into job ids. A group is resolved now, at
+ * submit time, into the jobs it holds right now. Unknown jobs or groups
+ * are an error (written to err).
+ */
+static int parse_deps(const char *spec, int **deps, int *ndeps, char *err, size_t errlen)
+{
+    char *copy = strdup(spec), *save = NULL;
+    int ok = 1;
+    for (char *t = strtok_r(copy, ",", &save); t && ok; t = strtok_r(NULL, ",", &save)) {
+        long v;
+        if ((t[0] == 'g' || t[0] == 'G') && parse_long(t + 1, &v) == 0 && v >= 1) {
+            if (!group_exists((int)v)) {
+                snprintf(err, errlen, "Group %ld does not exist.", v);
+                ok = 0;
+                break;
+            }
+            for (int i = 0; i < g_njobs; i++)
+                if (g_jobs[i]->group == (int)v)
+                    add_dep(deps, ndeps, g_jobs[i]->id);
+        } else if (parse_long(t, &v) == 0 && v >= 1) {
+            if (!job_find((int)v)) {
+                snprintf(err, errlen, "Job %ld does not exist.", v);
+                ok = 0;
+                break;
+            }
+            add_dep(deps, ndeps, (int)v);
+        } else {
+            snprintf(err, errlen, "Bad dependency '%s': use job ids and g<group>, e.g. 1,2,g3.", t);
+            ok = 0;
+        }
+    }
+    free(copy);
+    if (ok && *ndeps == 0) {
+        snprintf(err, errlen, "-depends-on lists no jobs.");
+        ok = 0;
+    }
+    return ok ? 0 : -1;
+}
+
+static void reply_queue_full(peer_t *p)
+{
+    log_line("Submit from %s rejected: QUEUE_FULL (%d entries)", p->user, JOB_QUEUE_CAPACITY);
+    msg_t *r = msg_new("REPLY");
+    msg_set_long(r, "ok", 0);
+    msg_set(r, "code", "QUEUE_FULL");
+    msg_setf(r, "text", "QUEUE_FULL: the job queue is full (%d jobs). Try again later.",
+             JOB_QUEUE_CAPACITY);
+    peer_send(p, r);
+    msg_free(r);
+}
+
+static void handle_submit(peer_t *p, msg_t *m)
+{
+    const char *bad = submit_invalid(m);
+    if (bad) {
+        reply(p, 0, "%s", bad);
         return;
     }
-    if (msg_get(m, "depends-on") || msg_get(m, "group") || msg_get(m, "every") ||
-        msg_get(m, "preemptible")) {
-        reply(p, 0, "-depends-on, -group, -preemptible and -every are not supported yet.");
+    if (msg_get(m, "every") || msg_get(m, "preemptible")) {
+        reply(p, 0, "-preemptible and -every are not supported yet.");
         return;
     }
-    if (strlen(path) >= PATH_MAX) {
-        reply(p, 0, "Binary path is too long.");
-        return;
+
+    int *deps = NULL, ndeps = 0;
+    const char *dspec = msg_get(m, "depends-on");
+    if (dspec) {
+        char err[160];
+        if (parse_deps(dspec, &deps, &ndeps, err, sizeof(err)) < 0) {
+            reply(p, 0, "%s", err);
+            free(deps);
+            return;
+        }
     }
     if (queue_occupancy() >= JOB_QUEUE_CAPACITY) {
-        log_line("Submit from %s rejected: QUEUE_FULL (%d entries)", p->user, JOB_QUEUE_CAPACITY);
-        msg_t *r = msg_new("REPLY");
-        msg_set_long(r, "ok", 0);
-        msg_set(r, "code", "QUEUE_FULL");
-        msg_setf(r, "text", "QUEUE_FULL: the job queue is full (%d jobs). Try again later.",
-                 JOB_QUEUE_CAPACITY);
-        peer_send(p, r);
-        msg_free(r);
+        reply_queue_full(p);
+        free(deps);
         return;
     }
 
-    job_t *j = calloc(1, sizeof(*j));
-    if (!j)
-        abort();
-    j->id = g_njobs + 1;
-    str_copy(j->user, p->user, sizeof(j->user));
-    str_copy(j->path, path, sizeof(j->path));
-    j->argc = (int)msg_get_long(m, "argc", 0);
-    if (j->argc < 0 || j->argc > 1024)
-        j->argc = 0;
-    j->argv = calloc((size_t)j->argc + 1, sizeof(char *));
-    for (int i = 0; i < j->argc; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "arg%d", i);
-        j->argv[i] = strdup(msg_get_str(m, key));
-    }
-    j->cores = (int)cores;
-    j->ram_mb = ram;
-    j->time_s = (int)tlim;
-    j->prio = (int)prio;
-    j->gpus = (int)gpus;
-    j->submit_ms = j->queued_ms = now_ms();
-    j->eff_prio_logged = j->prio;
-    j->exit_code = -1;
-    j->state = JOB_QUEUED;
-
-    g_jobs = realloc(g_jobs, sizeof(job_t *) * (size_t)(g_njobs + 1));
-    g_jobs[g_njobs++] = j;
-
-    log_line("Job %d SUBMITTED by %s (%s, %d cores, %ldMB, %ds, prio %d, %d GPU)",
-             j->id, j->user, j->path, j->cores, j->ram_mb, j->time_s, j->prio, j->gpus);
+    job_t *j = job_create(m, p->user);
+    j->deps = deps;
+    j->ndeps = ndeps;
+    log_line("Job %d SUBMITTED by %s (%s, %d cores, %ldMB, %ds, prio %d, %d GPU%s%s)",
+             j->id, j->user, j->path, j->cores, j->ram_mb, j->time_s, j->prio, j->gpus,
+             dspec ? ", depends on " : "", dspec ? dspec : "");
 
     msg_t *r = msg_new("REPLY");
     msg_set_long(r, "ok", 1);
     msg_set_long(r, "job", j->id);
+    if (ndeps) {
+        buf_t list = {0};
+        for (int i = 0; i < ndeps; i++) {
+            char item[24];
+            int n = snprintf(item, sizeof(item), "%s%d", i ? ", " : "", deps[i]);
+            buf_append(&list, item, (size_t)n);
+        }
+        buf_append(&list, "", 1);
+        msg_setf(r, "waiting_on", "Job%s %s", ndeps > 1 ? "s" : "", list.data);
+        buf_free(&list);
+
+        j->state = JOB_WAITING;
+        log_line("Job %d QUEUED -> WAITING (on %s)", j->id, msg_get_str(r, "waiting_on"));
+        job_check_deps(j); /* maybe every dependency is already done (or failed) */
+        if (j->state == JOB_CANCELLED)
+            msg_set(r, "note", j->reason);
+    }
     msg_set(r, "state", job_state_name(j->state));
     peer_send(p, r);
     msg_free(r);
-    g_sched_dirty = 1;
 }
 
 static void handle_status(peer_t *p, msg_t *m)
@@ -327,11 +403,10 @@ static void handle_cancel(peer_t *p, msg_t *m)
         snprintf(why, sizeof(why), "requested by %s", p->user);
     }
     snprintf(j->reason, sizeof(j->reason), "Cancelled by %s", p->user);
-    job_set_state(j, JOB_CANCELLED, why);
-
     reply(p, 1, "[Client] Job %d cancelled.", j->id);
     notify_user(j->user, "Job %d %s -> CANCELLED (requested by %s).", j->id,
                 job_state_name(from), p->user);
+    job_set_state(j, JOB_CANCELLED, why);
 }
 
 static void handle_client_msg(peer_t *p, msg_t *m)
@@ -409,12 +484,13 @@ static void handle_job_done(worker_t *w, msg_t *m)
     str_copy(j->reason, msg_get_str(m, "reason"), sizeof(j->reason));
 
     if (strcmp(msg_get_str(m, "result"), "COMPLETED") == 0) {
-        job_set_state(j, JOB_COMPLETED, "exit code 0");
+        /* Event first, so it arrives before any dependents' events. */
         notify_user(j->user, "Job %d COMPLETED successfully.", j->id);
+        job_set_state(j, JOB_COMPLETED, "exit code 0");
     } else {
+        notify_user(j->user, "Job %d FAILED. Reason: %s.", j->id, j->reason);
         job_set_state(j, JOB_FAILED, j->reason);
         log_line("[ERROR] Job %d Failed. Diagnosis: %s.", j->id, j->reason);
-        notify_user(j->user, "Job %d FAILED. Reason: %s.", j->id, j->reason);
     }
 }
 

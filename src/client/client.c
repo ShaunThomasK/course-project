@@ -219,7 +219,8 @@ static void cmd_help(void)
     printf("Commands:\n"
            "  nodes                       list workers\n"
            "  submit <binary> [args...] -cores N -ram MB -time SEC -prio 1-3 [-gpu N]\n"
-           "                              submit a job\n"
+           "         [-depends-on 1,2,g3] [-group N] [-preemptible] [-every SEC]\n"
+           "                              submit a job (-every registers a cron template)\n"
            "  status <job_id>             job state, worker and resource usage\n"
            "  logs <job_id> [-f]          job output (-f follows it; Ctrl+C stops)\n"
            "  cancel <job_id>             cancel a job\n"
@@ -399,7 +400,14 @@ static void handle_msg(msg_t *m)
         int ok = (int)msg_get_long(m, "ok", 0);
         if (g_wait == WAIT_SUBMIT) {
             if (ok) {
-                printf("[Client] Job submitted.\n");
+                const char *state = msg_get_str(m, "state");
+                if (strcmp(state, "WAITING") == 0)
+                    printf("[Client] Job submitted (WAITING on %s).\n", msg_get_str(m, "waiting_on"));
+                else if (strcmp(state, "CANCELLED") == 0)
+                    printf("[Client] Job submitted, but CANCELLED right away: %s.\n",
+                           msg_get_str(m, "note"));
+                else
+                    printf("[Client] Job submitted.\n");
                 printf("[Client] Job ID assigned: %lld\n", msg_get_long(m, "job", 0));
             } else if (strcmp(msg_get_str(m, "code"), "QUEUE_FULL") == 0) {
                 printf("[Client] The job queue is full; the job was not submitted. Try again later.\n");

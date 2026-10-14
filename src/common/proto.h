@@ -15,7 +15,7 @@
  * carries raw bytes (an executable, a chunk of job output, a checkpoint)
  * without any escaping.
  *
- * Message types are documented in docs/PROTOCOL.md.
+ * Message types are listed in the Protocol section of README.md.
  */
 #ifndef OSN_PROTO_H
 #define OSN_PROTO_H

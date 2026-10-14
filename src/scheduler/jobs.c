@@ -249,6 +249,8 @@ void job_render_status(job_t *j, buf_t *out)
         bprintf(out, "  - Group: %d\n", j->group);
     if (j->preemptible)
         bprintf(out, "  - Preemptible: yes\n");
+    if (j->cron_id)
+        bprintf(out, "  - Spawned by: Cron %d\n", j->cron_id);
     if (j->held_for && j->state == JOB_QUEUED)
         bprintf(out, "  - Preempted; held until Job %d starts\n", j->held_for);
     if (j->ndeps) {

@@ -266,8 +266,23 @@ static void handle_submit(peer_t *p, msg_t *m)
         reply(p, 0, "%s", bad);
         return;
     }
-    if (msg_get(m, "every")) {
-        reply(p, 0, "-every is not supported yet.");
+    const char *every = msg_get(m, "every");
+    if (every) {
+        long secs;
+        if (parse_long(every, &secs) < 0 || secs < 1) {
+            reply(p, 0, "-every needs a positive number of seconds.");
+            return;
+        }
+        if (msg_get(m, "depends-on")) {
+            reply(p, 0, "-every can't be combined with -depends-on.");
+            return;
+        }
+        msg_t *r = msg_new("REPLY");
+        msg_set_long(r, "ok", 1);
+        msg_set_long(r, "cron", cron_register(m, p->user, (int)secs));
+        msg_set_long(r, "every", secs);
+        peer_send(p, r);
+        msg_free(r);
         return;
     }
 
@@ -423,6 +438,19 @@ static void handle_client_msg(peer_t *p, msg_t *m)
         p->follow_job = 0;
     else if (msg_is(m, "CANCEL"))
         handle_cancel(p, m);
+    else if (msg_is(m, "CRONS")) {
+        buf_t b = {0};
+        render_crons(&b);
+        reply_buf(p, &b);
+        buf_free(&b);
+    } else if (msg_is(m, "CANCEL_CRON")) {
+        char err[160];
+        int id = (int)msg_get_long(m, "cron", 0);
+        if (cron_cancel(id, p->user, err, sizeof(err)) < 0)
+            reply(p, 0, "%s", err);
+        else
+            reply(p, 1, "[Client] Cron %d cancelled. Copies already queued or running are left alone.", id);
+    }
     else
         reply(p, 0, "Unknown request '%s'.", m->type);
 }
@@ -741,6 +769,7 @@ int main(int argc, char **argv)
             accept_peers(lfd);
 
         check_heartbeats();
+        cron_tick();
 
         uint64_t now = now_ms();
         if (g_sched_dirty || now - last_pass >= 1000) {

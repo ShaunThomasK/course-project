@@ -4,7 +4,7 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 LDLIBS  ?=
 
 COMMON    := src/common/common.c src/common/proto.c src/common/discovery.c
-SCHEDULER := src/scheduler/scheduler.c src/scheduler/jobs.c src/scheduler/pass.c
+SCHEDULER := src/scheduler/scheduler.c src/scheduler/jobs.c src/scheduler/pass.c src/scheduler/cron.c
 WORKER    := src/worker/worker.c src/worker/jobrun.c
 CLIENT    := src/client/client.c
 HEADERS   := $(wildcard src/*/*.h)

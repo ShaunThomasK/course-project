@@ -224,6 +224,8 @@ static void cmd_help(void)
            "  status <job_id>             job state, worker and resource usage\n"
            "  logs <job_id> [-f]          job output (-f follows it; Ctrl+C stops)\n"
            "  cancel <job_id>             cancel a job\n"
+           "  crons                       list cron templates\n"
+           "  cancel-cron <template_id>   stop a cron template's future copies\n"
            "  help                        this text\n"
            "  exit | quit                 leave the client\n");
 }
@@ -340,6 +342,20 @@ static int run_command(char *line)
         send_msg(m);
         g_wait = WAIT_REPLY;
         return 1;
+    } else if (strcmp(tok[0], "crons") == 0) {
+        send_msg(msg_new("CRONS"));
+        g_wait = WAIT_REPLY;
+        return 1;
+    } else if (strcmp(tok[0], "cancel-cron") == 0) {
+        if (n < 2 || parse_long(tok[1], &id) < 0 || id < 1) {
+            printf("[Client] Usage: cancel-cron <template_id>\n");
+            return 0;
+        }
+        msg_t *m = msg_new("CANCEL_CRON");
+        msg_set_long(m, "cron", id);
+        send_msg(m);
+        g_wait = WAIT_REPLY;
+        return 1;
     } else if (strcmp(tok[0], "logs") == 0) {
         if (parse_job_id(n > 1 ? tok[1] : NULL, &id) < 0)
             return 0;
@@ -399,7 +415,10 @@ static void handle_msg(msg_t *m)
     if (msg_is(m, "REPLY")) {
         int ok = (int)msg_get_long(m, "ok", 0);
         if (g_wait == WAIT_SUBMIT) {
-            if (ok) {
+            if (ok && msg_get(m, "cron")) {
+                printf("[Client] Cron template registered (every %llds).\n", msg_get_long(m, "every", 0));
+                printf("[Client] Template ID assigned: %lld\n", msg_get_long(m, "cron", 0));
+            } else if (ok) {
                 const char *state = msg_get_str(m, "state");
                 if (strcmp(state, "WAITING") == 0)
                     printf("[Client] Job submitted (WAITING on %s).\n", msg_get_str(m, "waiting_on"));

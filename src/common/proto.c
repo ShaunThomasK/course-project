@@ -99,6 +99,15 @@ void msg_free(msg_t *m)
     free(m);
 }
 
+msg_t *msg_clone(const msg_t *m)
+{
+    msg_t *c = msg_new(m->type);
+    for (int i = 0; i < m->nfields; i++)
+        msg_set(c, m->keys[i], m->vals[i]);
+    msg_set_blob(c, m->blob, m->blob_len);
+    return c;
+}
+
 void msg_set(msg_t *m, const char *key, const char *val)
 {
     for (int i = 0; i < m->nfields; i++) {

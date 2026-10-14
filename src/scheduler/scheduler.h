@@ -162,6 +162,15 @@ job_t *job_create(const msg_t *submit, const char *user);
  * soon as one fails. Returns 1 if j left WAITING. */
 int  job_check_deps(job_t *j);
 
+/* ---- cron.c (Section 12) ------------------------------------------------ */
+
+/* Registers a template from a SUBMIT message; returns its id. */
+int  cron_register(const msg_t *submit, const char *user, int every_s);
+/* Injects a copy of every template that is due. Call about once a second. */
+void cron_tick(void);
+void render_crons(buf_t *out);
+int  cron_cancel(int id, const char *user, char *err, size_t errlen);
+
 /* ---- pass.c ------------------------------------------------------------ */
 
 void schedule_pass(void);

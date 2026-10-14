@@ -52,6 +52,7 @@ typedef struct {
 
 msg_t      *msg_new(const char *type);
 void        msg_free(msg_t *m);
+msg_t      *msg_clone(const msg_t *m);
 void        msg_set(msg_t *m, const char *key, const char *val);
 void        msg_setf(msg_t *m, const char *key, const char *fmt, ...)
                 __attribute__((format(printf, 3, 4)));

@@ -1,0 +1,7 @@
+/scheduler
+/worker
+/client
+/build/
+*.o
+cache/
+tests/programs/bin/

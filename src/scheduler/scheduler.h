@@ -18,6 +18,7 @@
 
 #include "../common/common.h"
 #include "../common/proto.h"
+#include "../common/sha256.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -65,6 +66,7 @@ typedef struct job {
     int         id;
     char        user[USERNAME_MAX];
     char        path[PATH_MAX];   /* absolute path, or bare PATH command */
+    char        hash[SHA256_HEX_LEN + 1]; /* binary's SHA-256, "" if not readable (13) */
     int         argc;             /* program arguments, without argv[0] */
     char      **argv;
 
@@ -135,6 +137,13 @@ extern int        g_sched_dirty; /* something changed; run a pass soon */
 job_t    *job_find(int id);
 worker_t *worker_find(int id);
 
+/* Section 13: which binaries (by SHA-256) a worker has cached. */
+int  worker_cache_has(const worker_t *w, const char *hash);
+void worker_cache_add(worker_t *w, const char *hash);
+void worker_cache_remove(worker_t *w, const char *hash);
+/* Replaces the whole set from a comma-separated list. */
+void worker_cache_set(worker_t *w, const char *list);
+
 /* Sends to every client connection logged in as user. */
 void send_to_user(const char *user, const msg_t *m);
 /* Pushes an "[Event] ..." line to the owner of a job. */
@@ -174,5 +183,8 @@ int  cron_cancel(int id, const char *user, char *err, size_t errlen);
 /* ---- pass.c ------------------------------------------------------------ */
 
 void schedule_pass(void);
+/* Sends RUN_JOB for a job already marked RUNNING on w. force_full ships
+ * the binary even if w is believed to have it (after a cache miss). */
+void send_run_job(job_t *j, worker_t *w, int force_full);
 
 #endif

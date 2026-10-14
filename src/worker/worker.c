@@ -10,6 +10,7 @@
  */
 #include "worker.h"
 #include "../common/discovery.h"
+#include "../common/sha256.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -179,6 +180,10 @@ static int connect_and_register(void)
     msg_set_long(m, "ram", g_ram_mb);
     msg_set_long(m, "gpu", g_gpus);
     msg_set(m, "host", host);
+    cache_scan(); /* tell the scheduler what we still have (13) */
+    char *cached = cache_hash_list();
+    msg_set(m, "cached", cached);
+    free(cached);
     send_msg(m);
 
     msg_t *r = g_conn.fd >= 0 ? recv_msg(5000) : NULL;
@@ -265,6 +270,72 @@ static void pump_output(wjob_t *j, int all)
     } while (all);
 }
 
+static void report_failure_to_start(int id, int run, const char *why);
+
+int cache_in_use(const char *hash)
+{
+    for (int i = 0; i < g_njobs; i++)
+        if (strcmp(g_jobs[i]->hash, hash) == 0)
+            return 1;
+    return 0;
+}
+
+static void send_cache_state(void)
+{
+    msg_t *m = msg_new("CACHE_STATE");
+    char *list = cache_hash_list();
+    msg_set(m, "cached", list);
+    free(list);
+    send_msg(m);
+}
+
+/*
+ * Section 13: puts the job's program in the cache (or finds it there) and
+ * points the RUN_JOB at the cached copy. Returns -1 if the job can't start
+ * yet (cache miss reported, or a corrupted transfer).
+ */
+static int prepare_binary(msg_t *m, int id, int run)
+{
+    const char *hash = msg_get(m, "hash");
+    if (!hash)
+        return 0; /* a PATH command, nothing to cache */
+    const char *path = msg_get_str(m, "path");
+    const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+    char cpath[4096];
+
+    if (m->blob) {
+        char got[SHA256_HEX_LEN + 1];
+        sha256_hex(m->blob, m->blob_len, got);
+        if (strcmp(got, hash) != 0) {
+            report_failure_to_start(id, run, "Binary arrived corrupted (SHA-256 mismatch)");
+            return -1;
+        }
+        int evicted;
+        if (cache_store(base, hash, m->blob, m->blob_len, cpath, sizeof(cpath), &evicted) == 0) {
+            log_line("Job %d: cached %s (%zu bytes, sha256 %.8s...)", id, base, m->blob_len, hash);
+            msg_set(m, "local_binary", cpath);
+            msg_take_blob(m, NULL, 0);
+            if (evicted)
+                send_cache_state();
+        }
+        return 0; /* if storing failed the job still runs from the blob */
+    }
+    if (msg_get_long(m, "cached", 0)) {
+        if (cache_lookup(hash, cpath, sizeof(cpath)) < 0) {
+            log_line("Job %d: cached sha256 %.8s... is missing, asking for the full file", id, hash);
+            msg_t *miss = msg_new("CACHE_MISS");
+            msg_set_long(miss, "job", id);
+            msg_set_long(miss, "run", run);
+            msg_set(miss, "hash", hash);
+            send_msg(miss);
+            return -1;
+        }
+        log_line("Job %d: using cached %s", id, cpath);
+        msg_set(m, "local_binary", cpath);
+    }
+    return 0;
+}
+
 static void report_failure_to_start(int id, int run, const char *why)
 {
     log_line("[ERROR] Job %d Failed. Diagnosis: %s.", id, why);
@@ -295,6 +366,8 @@ static int handle_run_job(msg_t *m)
         report_failure_to_start(id, run, "Worker is already running this job");
         return 0;
     }
+    if (prepare_binary(m, id, run) < 0)
+        return 0;
     wjob_t *j = calloc(1, sizeof(*j));
     if (!j)
         abort();
@@ -475,6 +548,7 @@ int main(int argc, char **argv)
     parse_args(argc, argv);
     clamp_capacity();
     setup_privileges();
+    cache_init();
 
     if (connect_and_register() < 0) {
         fprintf(stderr, "worker: could not find or reach a scheduler. Exiting.\n");

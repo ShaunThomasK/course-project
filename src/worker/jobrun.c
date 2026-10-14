@@ -62,6 +62,33 @@ static int write_file(const char *path, const char *data, size_t len, mode_t mod
     return close(fd);
 }
 
+static int copy_file(const char *from, const char *to)
+{
+    int in = open(from, O_RDONLY);
+    if (in < 0)
+        return -1;
+    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    char buf[65536];
+    ssize_t n;
+    int rc = 0;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, (size_t)n) != n) {
+            rc = -1;
+            break;
+        }
+    }
+    if (n < 0)
+        rc = -1;
+    close(in);
+    if (close(out) < 0)
+        rc = -1;
+    return rc;
+}
+
 static void chown_or_fail(const char *path, int err_fd)
 {
     if (chown(path, g_nobody_uid, g_nobody_gid) < 0)
@@ -83,7 +110,10 @@ static void run_child(wjob_t *j, const msg_t *run, int err_fd, pid_t parent)
 
     const char *path = msg_get_str(run, "path");
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
-    int shipped = msg_get_long(run, "binary", 0) && run->blob;
+    /* The program comes from the cache (13), or straight from the message
+     * if it couldn't be cached. */
+    const char *cached = msg_get(run, "local_binary");
+    int shipped = cached || (msg_get_long(run, "binary", 0) && run->blob);
 
     /* 1. Own working directory, with the binary and output.log inside. */
     if (mkdir(j->dir, 0755) < 0)
@@ -91,7 +121,8 @@ static void run_child(wjob_t *j, const msg_t *run, int err_fd, pid_t parent)
     char file[256];
     if (shipped) {
         snprintf(file, sizeof(file), "%s/%s", j->dir, base);
-        if (write_file(file, run->blob, run->blob_len, 0755) < 0)
+        if (cached ? copy_file(cached, file) < 0
+                   : write_file(file, run->blob, run->blob_len, 0755) < 0)
             child_fail(err_fd, "copy binary", 126);
     }
     char ckpt[256];
@@ -212,6 +243,8 @@ int jobrun_start(wjob_t *j, const msg_t *run)
 {
     j->id = (int)msg_get_long(run, "job", 0);
     j->run = (int)msg_get_long(run, "run", 0);
+    if (msg_get(run, "local_binary"))
+        str_copy(j->hash, msg_get_str(run, "hash"), sizeof(j->hash));
     j->time_s = (int)msg_get_long(run, "time", 1);
     j->ram_mb = msg_get_long(run, "ram", 1);
     snprintf(j->dir, sizeof(j->dir), "/tmp/osn_job_%d", j->id);

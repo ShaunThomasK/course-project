@@ -18,6 +18,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#define MTIME_NSEC(st) ((st).st_mtimespec.tv_nsec)
+#else
+#define MTIME_NSEC(st) ((st).st_mtim.tv_nsec)
+#endif
+
 /* Effective priority under aging: one step better per 10 s queued, min 1. */
 static int effective_prio(const job_t *j, uint64_t now)
 {
@@ -43,6 +49,90 @@ static int cmp_jobs(const void *a, const void *b)
     return x->id - y->id; /* ids are handed out in submission order */
 }
 
+/* Reads the whole binary into memory; NULL if the scheduler can't read it. */
+static char *read_binary(const char *path, size_t *len)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return NULL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return NULL;
+    }
+    char *data = malloc(st.st_size > 0 ? (size_t)st.st_size : 1);
+    if (!data) {
+        close(fd);
+        return NULL;
+    }
+    size_t got = 0;
+    while (got < (size_t)st.st_size) {
+        ssize_t n = read(fd, data + got, (size_t)st.st_size - got);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    close(fd);
+    *len = got;
+    return data;
+}
+
+
+/* ---- Section 13: binary hashes ------------------------------------------ */
+
+/* Remembers each binary's hash by path + inode + size + mtime, so a big
+ * file isn't re-read and re-hashed on every scheduling decision. */
+typedef struct {
+    char   path[PATH_MAX];
+    dev_t  dev;
+    ino_t  ino;
+    off_t  size;
+    time_t mtime;
+    long   mtime_ns;
+    char   hash[SHA256_HEX_LEN + 1];
+} hash_memo_t;
+
+static hash_memo_t *g_memo;
+static int          g_nmemo;
+
+/* Fills j->hash from the file's content. -1 if it isn't a readable file. */
+static int job_binary_hash(job_t *j)
+{
+    j->hash[0] = '\0';
+    struct stat st;
+    if (!strchr(j->path, '/') || stat(j->path, &st) < 0 || !S_ISREG(st.st_mode))
+        return -1;
+    hash_memo_t *slot = NULL;
+    for (int i = 0; i < g_nmemo; i++)
+        if (strcmp(g_memo[i].path, j->path) == 0)
+            slot = &g_memo[i];
+    if (slot && slot->dev == st.st_dev && slot->ino == st.st_ino && slot->size == st.st_size &&
+        slot->mtime == st.st_mtime && slot->mtime_ns == (long)MTIME_NSEC(st)) {
+        memcpy(j->hash, slot->hash, sizeof(j->hash));
+        return 0;
+    }
+    size_t len;
+    char *data = read_binary(j->path, &len);
+    if (!data)
+        return -1;
+    sha256_hex(data, len, j->hash);
+    free(data);
+    if (!slot) {
+        g_memo = realloc(g_memo, sizeof(hash_memo_t) * (size_t)(g_nmemo + 1));
+        slot = &g_memo[g_nmemo++];
+        str_copy(slot->path, j->path, sizeof(slot->path));
+    }
+    slot->dev = st.st_dev;
+    slot->ino = st.st_ino;
+    slot->size = st.st_size;
+    slot->mtime = st.st_mtime;
+    slot->mtime_ns = (long)MTIME_NSEC(st);
+    memcpy(slot->hash, j->hash, sizeof(slot->hash));
+    return 0;
+}
+
 static int worker_qualifies(const worker_t *w, const job_t *j)
 {
     return w->state == WORKER_ALIVE && w->peer != NULL &&
@@ -52,9 +142,7 @@ static int worker_qualifies(const worker_t *w, const job_t *j)
 
 static int worker_has_cached(const worker_t *w, const job_t *j)
 {
-    (void)w;
-    (void)j;
-    return 0; /* Section 13 fills this in */
+    return j->hash[0] && worker_cache_has(w, j->hash);
 }
 
 /*
@@ -97,6 +185,7 @@ static int cmp_workers(const worker_t *a, const worker_t *b, const job_t *j,
 static worker_t *choose_worker(job_t *j)
 {
     worker_t *best = NULL, *second = NULL;
+    job_binary_hash(j); /* for the "already cached" tiebreaker */
     for (int i = 0; i < g_nworkers; i++) {
         worker_t *w = g_workers[i];
         if (!worker_qualifies(w, j))
@@ -121,40 +210,11 @@ static worker_t *choose_worker(job_t *j)
     return best;
 }
 
-/* Reads the whole binary into memory; NULL if the scheduler can't read it. */
-static char *read_binary(const char *path, size_t *len)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return NULL;
-    struct stat st;
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-        close(fd);
-        return NULL;
-    }
-    char *data = malloc(st.st_size > 0 ? (size_t)st.st_size : 1);
-    if (!data) {
-        close(fd);
-        return NULL;
-    }
-    size_t got = 0;
-    while (got < (size_t)st.st_size) {
-        ssize_t n = read(fd, data + got, (size_t)st.st_size - got);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            break;
-        got += (size_t)n;
-    }
-    close(fd);
-    *len = got;
-    return data;
-}
-
-static void dispatch(job_t *j, worker_t *w)
+void send_run_job(job_t *j, worker_t *w, int force_full)
 {
     msg_t *m = msg_new("RUN_JOB");
     msg_set_long(m, "job", j->id);
+    msg_set_long(m, "run", j->run);
     msg_set(m, "path", j->path);
     msg_set_long(m, "argc", j->argc);
     for (int i = 0; i < j->argc; i++) {
@@ -167,21 +227,39 @@ static void dispatch(job_t *j, worker_t *w)
     msg_set_long(m, "time", j->time_s);
     msg_set_long(m, "gpu", j->gpus);
 
-    /* A path with a '/' is a file the scheduler ships to the worker. A bare
-     * name (or a file we can't read) runs by path on the worker. */
+    /* A path with a '/' is a file the scheduler ships to the worker, or
+     * just names by hash if the worker has it cached (13). A bare name, or
+     * a file we can't read, runs by path on the worker. */
     if (strchr(j->path, '/')) {
-        size_t len = 0;
-        char *data = read_binary(j->path, &len);
-        if (data) {
+        if (!force_full && job_binary_hash(j) == 0 && worker_cache_has(w, j->hash)) {
             msg_set_long(m, "binary", 1);
-            msg_take_blob(m, data, len);
-            log_line("Job %d: sent %s (%zu bytes) -> Worker %d", j->id, j->path, len, w->id);
+            msg_set_long(m, "cached", 1);
+            msg_set(m, "hash", j->hash);
+            log_line("Job %d: %s already cached (sha256 %.8s...) on Worker %d, not sending",
+                     j->id, j->path, j->hash, w->id);
         } else {
-            log_line("Job %d: can't read %s (%s), worker runs it by path",
-                     j->id, j->path, strerror(errno));
+            size_t len = 0;
+            char *data = read_binary(j->path, &len);
+            if (data) {
+                sha256_hex(data, len, j->hash); /* the bytes we actually send */
+                msg_set_long(m, "binary", 1);
+                msg_set(m, "hash", j->hash);
+                msg_take_blob(m, data, len);
+                worker_cache_add(w, j->hash);
+                log_line("Job %d: sent %s (%zu bytes, sha256 %.8s...) -> Worker %d",
+                         j->id, j->path, len, j->hash, w->id);
+            } else {
+                log_line("Job %d: can't read %s (%s), worker runs it by path",
+                         j->id, j->path, strerror(errno));
+            }
         }
     }
+    peer_send(w->peer, m);
+    msg_free(m);
+}
 
+static void dispatch(job_t *j, worker_t *w)
+{
     if (j->out_total > 0) {
         /* Earlier attempts' output stays; mark where this one starts. */
         char mark[96];
@@ -195,15 +273,13 @@ static void dispatch(job_t *j, worker_t *w)
     else
         j->attempts++;
     j->run++;
-    msg_set_long(m, "run", j->run);
     j->rss_kb = j->peak_rss_kb = j->page_faults = 0;
     j->cpu_s = 0;
     char why[64];
     snprintf(why, sizeof(why), "Worker %d, attempt %d", w->id, j->attempts);
     job_set_state(j, JOB_RUNNING, why);
 
-    peer_send(w->peer, m);
-    msg_free(m);
+    send_run_job(j, w, 0);
 
     if (j->attempts > 1)
         notify_user(j->user, "Job %d (attempt %d) RUNNING on Worker %d.", j->id, j->attempts, w->id);

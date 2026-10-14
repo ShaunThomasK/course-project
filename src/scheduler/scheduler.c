@@ -45,6 +45,45 @@ worker_t *worker_find(int id)
     return NULL;
 }
 
+int worker_cache_has(const worker_t *w, const char *hash)
+{
+    for (int i = 0; i < w->ncached; i++)
+        if (strcmp(w->cached[i], hash) == 0)
+            return 1;
+    return 0;
+}
+
+void worker_cache_add(worker_t *w, const char *hash)
+{
+    if (!*hash || worker_cache_has(w, hash))
+        return;
+    w->cached = realloc(w->cached, sizeof(char *) * (size_t)(w->ncached + 1));
+    w->cached[w->ncached++] = strdup(hash);
+}
+
+void worker_cache_remove(worker_t *w, const char *hash)
+{
+    for (int i = 0; i < w->ncached; i++) {
+        if (strcmp(w->cached[i], hash) == 0) {
+            free(w->cached[i]);
+            w->cached[i] = w->cached[--w->ncached];
+            return;
+        }
+    }
+}
+
+void worker_cache_set(worker_t *w, const char *list)
+{
+    for (int i = 0; i < w->ncached; i++)
+        free(w->cached[i]);
+    w->ncached = 0;
+    char *copy = strdup(list), *save = NULL;
+    for (char *h = strtok_r(copy, ",", &save); h; h = strtok_r(NULL, ",", &save))
+        if (strlen(h) == SHA256_HEX_LEN)
+            worker_cache_add(w, h);
+    free(copy);
+}
+
 void peer_send(peer_t *p, const msg_t *m)
 {
     if (!p || p->closing)
@@ -537,6 +576,21 @@ static void handle_worker_msg(peer_t *p, msg_t *m)
             job_append_output(j, m->blob, m->blob_len);
     } else if (msg_is(m, "JOB_DONE")) {
         handle_job_done(w, m);
+    } else if (msg_is(m, "CACHE_STATE")) {
+        worker_cache_set(w, msg_get_str(m, "cached"));
+        log_line("Worker %d cache now holds %d program(s)", w->id, w->ncached);
+    } else if (msg_is(m, "CACHE_MISS")) {
+        /* The worker lost a file we thought it had: forget it, send it
+         * in full. Not a failed attempt. */
+        const char *hash = msg_get_str(m, "hash");
+        worker_cache_remove(w, hash);
+        job_t *j = job_find((int)msg_get_long(m, "job", 0));
+        if (j && j->state == JOB_RUNNING && j->worker_id == w->id &&
+            msg_get_long(m, "run", 0) == j->run) {
+            log_line("Job %d: Worker %d no longer has sha256 %.8s..., sending the full file",
+                     j->id, w->id, hash);
+            send_run_job(j, w, 1);
+        }
     } else if (msg_is(m, "DRAIN")) {
         if (w->state == WORKER_ALIVE || w->state == WORKER_SUSPECTED) {
             warn_users_of_worker(w, "DRAINING (finishing its jobs, then leaving).");
@@ -583,13 +637,14 @@ static void handle_new_peer_msg(peer_t *p, msg_t *m)
         w->ram_mb = w->free_ram_mb = msg_get_long(m, "ram", 0);
         w->gpus = w->free_gpus = (int)msg_get_long(m, "gpu", 0);
         w->last_heartbeat_ms = now_ms();
+        worker_cache_set(w, msg_get_str(m, "cached"));
         g_workers = realloc(g_workers, sizeof(worker_t *) * (size_t)(g_nworkers + 1));
         g_workers[g_nworkers++] = w;
 
         p->kind = PEER_WORKER;
         p->worker_id = w->id;
-        log_line("Worker %d connected. Cores: %d, RAM: %ldMB, GPU: %d (host %s)",
-                 w->id, w->cores, w->ram_mb, w->gpus, w->host);
+        log_line("Worker %d connected. Cores: %d, RAM: %ldMB, GPU: %d (host %s, %d cached program(s))",
+                 w->id, w->cores, w->ram_mb, w->gpus, w->host, w->ncached);
 
         msg_t *r = msg_new("REGISTER_OK");
         msg_set_long(r, "id", w->id);

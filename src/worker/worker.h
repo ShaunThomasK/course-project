@@ -29,6 +29,7 @@ typedef struct {
     int      time_s;
     long     ram_mb;
     char     dir[64];        /* /tmp/osn_job_<id> */
+    char     hash[65];       /* SHA-256 of its cached binary, "" if none (13) */
     off_t    out_off;        /* how much of output.log was already sent */
     int      err_fd;         /* setup/exec errors from the child (CLOEXEC pipe) */
 
@@ -63,5 +64,20 @@ char *jobrun_read_output(wjob_t *j, size_t max, size_t *len);
 int  jobrun_diagnose(wjob_t *j, char *reason, size_t len);
 /* Removes /tmp/osn_job_<id>. */
 void jobrun_cleanup(wjob_t *j);
+
+/* ---- cache.c (Section 13) ------------------------------------------------ */
+
+void  cache_init(void);
+/* Re-reads the cache folder (at every (re)registration). */
+void  cache_scan(void);
+/* Comma-separated hashes of every cached program (malloc()ed). */
+char *cache_hash_list(void);
+/* Stores a program, evicting LRU entries to fit. Fills path_out. */
+int   cache_store(const char *name, const char *hash, const char *data, size_t len,
+                  char *path_out, size_t n, int *evicted);
+/* Finds a cached program and marks it used. -1 if it is gone. */
+int   cache_lookup(const char *hash, char *path_out, size_t n);
+/* Implemented by worker.c: is a running job using this program? */
+int   cache_in_use(const char *hash);
 
 #endif

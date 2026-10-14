@@ -463,6 +463,49 @@ static void handle_cancel(peer_t *p, msg_t *m)
     job_set_state(j, JOB_CANCELLED, why);
 }
 
+static void handle_migrate(peer_t *p, msg_t *m)
+{
+    job_t *j = job_find((int)msg_get_long(m, "job", 0));
+    if (!j) {
+        reply(p, 0, "No such job: %s", msg_get_str(m, "job"));
+        return;
+    }
+    if (strcmp(j->user, p->user) != 0) {
+        reply(p, 0, "Job %d belongs to %s; you can only migrate your own jobs.", j->id, j->user);
+        return;
+    }
+    if (j->state != JOB_RUNNING) {
+        reply(p, 0, "Job %d is %s, not RUNNING; only running jobs can be migrated.", j->id,
+              job_state_name(j->state));
+        return;
+    }
+    if (j->migrating) {
+        reply(p, 0, "Job %d is already being migrated.", j->id);
+        return;
+    }
+    worker_t *w = worker_find(j->worker_id);
+    if (!w || !w->peer) {
+        reply(p, 0, "Job %d's worker is unreachable; it will be rescued if the worker dies.", j->id);
+        return;
+    }
+    msg_t *k = msg_new("KILL_JOB");
+    msg_set_long(k, "job", j->id);
+    msg_set_long(k, "run", j->run);
+    msg_set(k, "reason", "migrate");
+    msg_set(k, "by", p->user);
+    peer_send(w->peer, k);
+    msg_free(k);
+    j->migrating = 1;
+    log_line("Job %d: migration off Worker %d requested by %s (SIGTERM, then SIGKILL after 2s)",
+             j->id, w->id, p->user);
+    if (j->ckpt)
+        reply(p, 1, "[Client] Migrating Job %d off Worker %d. It will resume from checkpoint #%d.",
+              j->id, w->id, j->ckpt_num);
+    else
+        reply(p, 1, "[Client] Migrating Job %d off Worker %d. It has no checkpoint yet, so it will restart from the beginning.",
+              j->id, w->id);
+}
+
 static void handle_client_msg(peer_t *p, msg_t *m)
 {
     if (msg_is(m, "SUBMIT"))
@@ -477,6 +520,8 @@ static void handle_client_msg(peer_t *p, msg_t *m)
         p->follow_job = 0;
     else if (msg_is(m, "CANCEL"))
         handle_cancel(p, m);
+    else if (msg_is(m, "MIGRATE"))
+        handle_migrate(p, m);
     else if (msg_is(m, "CRONS")) {
         buf_t b = {0};
         render_crons(&b);
@@ -549,8 +594,25 @@ static void handle_job_done(worker_t *w, msg_t *m)
     j->exit_code = (int)msg_get_long(m, "exit_code", -1);
     j->term_signal = (int)msg_get_long(m, "signal", 0);
     str_copy(j->reason, msg_get_str(m, "reason"), sizeof(j->reason));
+    int was_migrating = j->migrating;
+    j->migrating = 0;
 
-    if (strcmp(msg_get_str(m, "result"), "COMPLETED") == 0) {
+    if (strcmp(msg_get_str(m, "result"), "KILLED") == 0 && was_migrating) {
+        /* Migration (14): back to the queue, no attempt used, and the next
+         * start avoids this worker if it can. */
+        j->reason[0] = '\0';
+        j->free_restart = 1;
+        j->migrated_from = w->id;
+        if (j->ckpt)
+            notify_user(j->user, "Job %d stopped on Worker %d and moved back to QUEUED; it resumes from checkpoint #%d.",
+                        j->id, w->id, j->ckpt_num);
+        else
+            notify_user(j->user, "Job %d stopped on Worker %d and moved back to QUEUED; it has no checkpoint, so it restarts from the beginning.",
+                        j->id, w->id);
+        char why[64];
+        snprintf(why, sizeof(why), "migrated off Worker %d, no attempt used", w->id);
+        job_set_state(j, JOB_QUEUED, why);
+    } else if (strcmp(msg_get_str(m, "result"), "COMPLETED") == 0) {
         /* Event first, so it arrives before any dependents' events. */
         notify_user(j->user, "Job %d COMPLETED successfully.", j->id);
         job_set_state(j, JOB_COMPLETED, "exit code 0");
@@ -576,6 +638,22 @@ static void handle_worker_msg(peer_t *p, msg_t *m)
             job_append_output(j, m->blob, m->blob_len);
     } else if (msg_is(m, "JOB_DONE")) {
         handle_job_done(w, m);
+    } else if (msg_is(m, "CHECKPOINT")) {
+        /* Keep the latest checkpoint of the job's current run (14). A
+         * preempted job may still send its last one after being requeued. */
+        job_t *j = job_find((int)msg_get_long(m, "job", 0));
+        if (j && j->worker_id == w->id && msg_get_long(m, "run", 0) == j->run &&
+            (j->state == JOB_RUNNING || j->state == JOB_QUEUED)) {
+            free(j->ckpt);
+            j->ckpt = m->blob;
+            j->ckpt_len = m->blob_len;
+            m->blob = NULL;
+            m->blob_len = 0;
+            j->ckpt_num++;
+            j->ckpt_ms = now_ms();
+            log_line("Job %d: checkpoint #%d (%zu bytes) from Worker %d", j->id, j->ckpt_num,
+                     j->ckpt_len, w->id);
+        }
     } else if (msg_is(m, "CACHE_STATE")) {
         worker_cache_set(w, msg_get_str(m, "cached"));
         log_line("Worker %d cache now holds %d program(s)", w->id, w->ncached);

@@ -117,6 +117,7 @@ typedef struct job {
 
     /* Section 14: checkpoints and migration. */
     int      migrated_from;       /* worker to avoid on the next start */
+    int      migrating;           /* SIGTERM sent, waiting for the job to stop */
     char    *ckpt;
     size_t   ckpt_len;
     int      ckpt_num;

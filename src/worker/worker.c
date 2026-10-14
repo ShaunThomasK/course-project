@@ -36,6 +36,15 @@ static int    g_id;
 static wjob_t **g_jobs;
 static int      g_njobs;
 
+/* Section 14: checkpoints the scheduler sent ahead of a RUN_JOB. */
+typedef struct {
+    int    job;
+    char  *data;
+    size_t len;
+} pending_ckpt_t;
+static pending_ckpt_t *g_restore;
+static int             g_nrestore;
+
 static volatile sig_atomic_t g_sigint;
 static int g_draining;
 static int g_stdin_open = 1;
@@ -251,7 +260,58 @@ static void remove_job(wjob_t *j)
             break;
         }
     }
+    free(j->ckpt);
     free(j);
+}
+
+static void handle_restore(msg_t *m)
+{
+    int job = (int)msg_get_long(m, "job", 0);
+    pending_ckpt_t *p = NULL;
+    for (int i = 0; i < g_nrestore; i++)
+        if (g_restore[i].job == job)
+            p = &g_restore[i];
+    if (!p) {
+        g_restore = realloc(g_restore, sizeof(*g_restore) * (size_t)(g_nrestore + 1));
+        p = &g_restore[g_nrestore++];
+        p->job = job;
+    } else {
+        free(p->data);
+    }
+    p->data = m->blob;
+    p->len = m->blob_len;
+    m->blob = NULL; /* now ours */
+    m->blob_len = 0;
+    log_line("Job %d: received checkpoint #%lld (%zu bytes) to resume from", job,
+             msg_get_long(m, "num", 0), p->len);
+}
+
+/* Takes the pending checkpoint for a job (caller frees data). */
+static char *take_restore(int job, size_t *len)
+{
+    for (int i = 0; i < g_nrestore; i++) {
+        if (g_restore[i].job == job) {
+            char *d = g_restore[i].data;
+            *len = g_restore[i].len;
+            g_restore[i] = g_restore[--g_nrestore];
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* Sends the job's checkpoint if it wrote a new one (14). */
+static void pump_checkpoint(wjob_t *j)
+{
+    size_t len;
+    char *data = jobrun_new_checkpoint(j, &len);
+    if (!data)
+        return;
+    msg_t *m = msg_new("CHECKPOINT");
+    msg_set_long(m, "job", j->id);
+    msg_set_long(m, "run", j->run);
+    msg_take_blob(m, data, len);
+    send_msg(m);
 }
 
 /* Sends whatever is new in output.log. With all=1 drains it completely. */
@@ -371,7 +431,13 @@ static int handle_run_job(msg_t *m)
     wjob_t *j = calloc(1, sizeof(*j));
     if (!j)
         abort();
-    if (jobrun_start(j, m) < 0) {
+    size_t clen = 0;
+    char *ckpt = take_restore(id, &clen);
+    int rc = jobrun_start(j, m, ckpt, clen);
+    if (ckpt && rc == 0)
+        log_line("Job %d: checkpoint (%zu bytes) placed in %s/checkpoint/state", id, clen, j->dir);
+    free(ckpt);
+    if (rc < 0) {
         char why[128];
         snprintf(why, sizeof(why), "Worker could not fork: %s", strerror(errno));
         free(j);
@@ -395,6 +461,12 @@ static void handle_kill_job(msg_t *m)
         why = KILL_PREEMPT;
     else if (strcmp(reason, "migrate") == 0)
         why = KILL_MIGRATE;
+    if (why == KILL_MIGRATE) {
+        /* Give it a chance to write a last checkpoint (14). */
+        log_line("Job %d: migration requested, sending SIGTERM (SIGKILL in 2s)", j->id);
+        jobrun_terminate(j, why);
+        return;
+    }
     log_line("Job %d: kill requested (%s%s%s), sending SIGKILL", j->id, reason,
              msg_get(m, "by") ? " by " : "", msg_get_str(m, "by"));
     jobrun_kill(j, why, msg_get(m, "by"));
@@ -404,6 +476,7 @@ static void handle_kill_job(msg_t *m)
 static void finish_job(wjob_t *j)
 {
     pump_output(j, 1);
+    pump_checkpoint(j); /* e.g. the one it wrote on SIGTERM */
     char reason[300];
     int ok = jobrun_diagnose(j, reason, sizeof(reason));
 
@@ -460,9 +533,15 @@ static void tick_jobs(int sample)
             log_line("Job %d: wall-clock limit of %ds reached, sending SIGKILL", j->id, j->time_s);
             jobrun_kill(j, KILL_TIMEOUT, NULL);
         }
+        if (j->term_deadline && now >= j->term_deadline) {
+            log_line("Job %d: still running 2s after SIGTERM, sending SIGKILL", j->id);
+            j->term_deadline = 0;
+            jobrun_kill(j, j->killed, NULL);
+        }
         if (sample) {
             jobrun_sample(j);
             pump_output(j, 0);
+            pump_checkpoint(j);
         }
         i++;
     }
@@ -606,6 +685,8 @@ int main(int argc, char **argv)
                         continue; /* kept for later */
                     if (msg_is(m, "KILL_JOB"))
                         handle_kill_job(m);
+                    else if (msg_is(m, "RESTORE_CKPT"))
+                        handle_restore(m);
                     msg_free(m);
                 }
                 if (got < 0)

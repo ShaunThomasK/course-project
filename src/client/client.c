@@ -224,6 +224,7 @@ static void cmd_help(void)
            "  status <job_id>             job state, worker and resource usage\n"
            "  logs <job_id> [-f]          job output (-f follows it; Ctrl+C stops)\n"
            "  cancel <job_id>             cancel a job\n"
+           "  migrate <job_id>            move a running job to another worker\n"
            "  crons                       list cron templates\n"
            "  cancel-cron <template_id>   stop a cron template's future copies\n"
            "  help                        this text\n"
@@ -334,10 +335,13 @@ static int run_command(char *line)
         return 1;
     } else if (strcmp(tok[0], "submit") == 0) {
         return cmd_submit(tok, n);
-    } else if (strcmp(tok[0], "status") == 0 || strcmp(tok[0], "cancel") == 0) {
+    } else if (strcmp(tok[0], "status") == 0 || strcmp(tok[0], "cancel") == 0 ||
+               strcmp(tok[0], "migrate") == 0) {
         if (parse_job_id(n > 1 ? tok[1] : NULL, &id) < 0)
             return 0;
-        msg_t *m = msg_new(strcmp(tok[0], "status") == 0 ? "STATUS" : "CANCEL");
+        msg_t *m = msg_new(strcmp(tok[0], "status") == 0   ? "STATUS"
+                           : strcmp(tok[0], "cancel") == 0 ? "CANCEL"
+                                                           : "MIGRATE");
         msg_set_long(m, "job", id);
         send_msg(m);
         g_wait = WAIT_REPLY;

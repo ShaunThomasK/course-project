@@ -186,9 +186,17 @@ static worker_t *choose_worker(job_t *j)
 {
     worker_t *best = NULL, *second = NULL;
     job_binary_hash(j); /* for the "already cached" tiebreaker */
+
+    /* A migrated job avoids the worker it left, if another one qualifies (14). */
+    int avoid = 0;
+    if (j->migrated_from) {
+        for (int i = 0; i < g_nworkers && !avoid; i++)
+            if (g_workers[i]->id != j->migrated_from && worker_qualifies(g_workers[i], j))
+                avoid = j->migrated_from;
+    }
     for (int i = 0; i < g_nworkers; i++) {
         worker_t *w = g_workers[i];
-        if (!worker_qualifies(w, j))
+        if (!worker_qualifies(w, j) || w->id == avoid)
             continue;
         if (!best || cmp_workers(w, best, j, NULL, 0) < 0) {
             second = best;
@@ -200,6 +208,8 @@ static worker_t *choose_worker(job_t *j)
     if (!best)
         return NULL;
 
+    if (avoid)
+        log_line("Job %d: excluding Worker %d, which it was just migrated from", j->id, avoid);
     if (second) {
         char why[128];
         cmp_workers(best, second, j, why, sizeof(why));
@@ -212,6 +222,19 @@ static worker_t *choose_worker(job_t *j)
 
 void send_run_job(job_t *j, worker_t *w, int force_full)
 {
+    /* The saved checkpoint goes first, then the binary (14, 13). */
+    if (j->ckpt) {
+        msg_t *c = msg_new("RESTORE_CKPT");
+        msg_set_long(c, "job", j->id);
+        msg_set_long(c, "run", j->run);
+        msg_set_long(c, "num", j->ckpt_num);
+        msg_set_blob(c, j->ckpt, j->ckpt_len);
+        peer_send(w->peer, c);
+        msg_free(c);
+        log_line("Job %d: sent checkpoint #%d (%zu bytes) -> Worker %d", j->id, j->ckpt_num,
+                 j->ckpt_len, w->id);
+    }
+
     msg_t *m = msg_new("RUN_JOB");
     msg_set_long(m, "job", j->id);
     msg_set_long(m, "run", j->run);
@@ -268,6 +291,7 @@ static void dispatch(job_t *j, worker_t *w)
         job_append_output(j, mark, (size_t)n);
     }
     j->worker_id = w->id;
+    j->migrated_from = 0;
     if (j->free_restart)
         j->free_restart = 0; /* preempted or migrated: not a failure (10, 14) */
     else

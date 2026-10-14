@@ -36,6 +36,14 @@ typedef struct {
     kill_reason_t killed;
     char          killed_by[USERNAME_MAX];
 
+    /* Section 14: the checkpoint file as we last saw it. */
+    time_t   ckpt_mtime;
+    long     ckpt_mtime_ns;
+    off_t    ckpt_size;
+    char    *ckpt;           /* last content sent or restored */
+    size_t   ckpt_len;
+    uint64_t term_deadline;  /* migrate: SIGKILL at this time, 0 = none */
+
     /* Telemetry (5D). */
     long rss_kb, peak_kb, faults, cpu_ms;
 
@@ -48,11 +56,17 @@ extern int   g_is_root;
 extern uid_t g_nobody_uid;
 extern gid_t g_nobody_gid;
 
-/* Forks and starts the job described by a RUN_JOB message. 0 on success,
- * -1 with errno set if the fork failed. */
-int  jobrun_start(wjob_t *j, const msg_t *run);
+/* Forks and starts the job described by a RUN_JOB message, placing the
+ * checkpoint (if any) in its checkpoint dir first. 0 on success, -1 with
+ * errno set if the fork failed. */
+int  jobrun_start(wjob_t *j, const msg_t *run, const char *ckpt, size_t ckpt_len);
 /* Kills the job's whole process group with SIGKILL and remembers why. */
 void jobrun_kill(wjob_t *j, kill_reason_t why, const char *by);
+/* SIGTERM now, SIGKILL 2 s later (migration, Section 14). */
+void jobrun_terminate(wjob_t *j, kill_reason_t why);
+/* Returns a new checkpoint (malloc()ed) if the job wrote one since the
+ * last call, else NULL. */
+char *jobrun_new_checkpoint(wjob_t *j, size_t *len);
 /* Non-blocking reap. Returns 1 once the job has exited. */
 int  jobrun_reap(wjob_t *j);
 /* Updates rss/peak/faults/cpu from the OS. */

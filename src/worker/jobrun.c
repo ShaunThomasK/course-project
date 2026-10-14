@@ -95,7 +95,8 @@ static void chown_or_fail(const char *path, int err_fd)
         child_fail(err_fd, "chown", 126);
 }
 
-static void run_child(wjob_t *j, const msg_t *run, int err_fd, pid_t parent)
+static void run_child(wjob_t *j, const msg_t *run, int err_fd, pid_t parent,
+                      const char *ckpt_data, size_t ckpt_len)
 {
     /* Own process group: Ctrl+C on the worker's terminal must not reach the
      * job (draining lets jobs finish), and a kill reaches its children. */
@@ -129,6 +130,13 @@ static void run_child(wjob_t *j, const msg_t *run, int err_fd, pid_t parent)
     snprintf(ckpt, sizeof(ckpt), "%s/checkpoint", j->dir);
     if (mkdir(ckpt, 0755) < 0)
         child_fail(err_fd, "mkdir checkpoint", 126);
+    char state[300];
+    snprintf(state, sizeof(state), "%s/state", ckpt);
+    if (ckpt_data) {
+        /* Resuming: put the saved checkpoint where the job looks for it (14). */
+        if (write_file(state, ckpt_data, ckpt_len, 0644) < 0)
+            child_fail(err_fd, "restore checkpoint", 126);
+    }
     char logf[256];
     snprintf(logf, sizeof(logf), "%s/output.log", j->dir);
     int out = open(logf, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
@@ -138,6 +146,8 @@ static void run_child(wjob_t *j, const msg_t *run, int err_fd, pid_t parent)
         chown_or_fail(j->dir, err_fd);
         chown_or_fail(ckpt, err_fd);
         chown_or_fail(logf, err_fd);
+        if (ckpt_data)
+            chown_or_fail(state, err_fd);
         if (shipped)
             chown_or_fail(file, err_fd);
     }
@@ -239,7 +249,7 @@ void jobrun_cleanup(wjob_t *j)
     nftw(j->dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
 }
 
-int jobrun_start(wjob_t *j, const msg_t *run)
+int jobrun_start(wjob_t *j, const msg_t *run, const char *ckpt, size_t ckpt_len)
 {
     j->id = (int)msg_get_long(run, "job", 0);
     j->run = (int)msg_get_long(run, "run", 0);
@@ -267,12 +277,18 @@ int jobrun_start(wjob_t *j, const msg_t *run)
     }
     if (pid == 0) {
         close(p[0]);
-        run_child(j, run, p[1], parent);
+        run_child(j, run, p[1], parent, ckpt, ckpt_len);
         _exit(127); /* not reached */
     }
     close(p[1]);
     setpgid(pid, pid); /* same as the child does; whoever runs first wins */
     fcntl(p[0], F_SETFL, O_NONBLOCK);
+    if (ckpt) {
+        /* Remember what we restored so it isn't reported as a new checkpoint. */
+        j->ckpt = malloc(ckpt_len ? ckpt_len : 1);
+        memcpy(j->ckpt, ckpt, ckpt_len);
+        j->ckpt_len = ckpt_len;
+    }
     j->pid = pid;
     j->err_fd = p[0];
     j->start_ms = now_ms();
@@ -289,6 +305,64 @@ void jobrun_kill(wjob_t *j, kill_reason_t why, const char *by)
     }
     if (kill(-j->pid, SIGKILL) < 0)
         kill(j->pid, SIGKILL);
+}
+
+void jobrun_terminate(wjob_t *j, kill_reason_t why)
+{
+    if (j->exited)
+        return;
+    if (j->killed == KILL_NONE)
+        j->killed = why;
+    if (kill(-j->pid, SIGTERM) < 0)
+        kill(j->pid, SIGTERM);
+    j->term_deadline = now_ms() + 2000;
+}
+
+#define CHECKPOINT_MAX (1024 * 1024)
+
+char *jobrun_new_checkpoint(wjob_t *j, size_t *len)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/checkpoint/state", j->dir);
+    struct stat st;
+    if (stat(path, &st) < 0 || !S_ISREG(st.st_mode))
+        return NULL;
+#ifdef __APPLE__
+    long ns = st.st_mtimespec.tv_nsec;
+#else
+    long ns = st.st_mtim.tv_nsec;
+#endif
+    if (st.st_mtime == j->ckpt_mtime && ns == j->ckpt_mtime_ns && st.st_size == j->ckpt_size)
+        return NULL; /* unchanged since we last looked */
+    j->ckpt_mtime = st.st_mtime;
+    j->ckpt_mtime_ns = ns;
+    j->ckpt_size = st.st_size;
+    if (st.st_size > CHECKPOINT_MAX) {
+        log_line("Job %d: checkpoint is %lld bytes, over the %d byte limit; not sent", j->id,
+                 (long long)st.st_size, CHECKPOINT_MAX);
+        return NULL;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return NULL;
+    char *data = malloc((size_t)st.st_size + 1);
+    ssize_t n = data ? read(fd, data, (size_t)st.st_size) : -1;
+    close(fd);
+    if (n < 0) {
+        free(data);
+        return NULL;
+    }
+    if (j->ckpt && (size_t)n == j->ckpt_len && memcmp(data, j->ckpt, (size_t)n) == 0) {
+        free(data); /* same content, e.g. the one we restored */
+        return NULL;
+    }
+    free(j->ckpt);
+    j->ckpt = malloc((size_t)n + 1);
+    memcpy(j->ckpt, data, (size_t)n);
+    j->ckpt_len = (size_t)n;
+    *len = (size_t)n;
+    return data;
 }
 
 int jobrun_reap(wjob_t *j)

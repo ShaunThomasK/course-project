@@ -70,6 +70,7 @@ void job_set_state(job_t *j, job_state_t to, const char *why)
 
 void job_rescue(job_t *j)
 {
+    j->migrating = 0;
     worker_t *w = worker_find(j->worker_id);
     if (w)
         release(w, j);
@@ -92,7 +93,11 @@ void job_rescue(job_t *j)
         j->state = JOB_QUEUED;
         j->queued_ms = now_ms();
         j->eff_prio_logged = j->prio;
-        notify_user(j->user, "Job %d (attempt %d) moved back to QUEUED.", j->id, j->attempts);
+        if (j->ckpt)
+            notify_user(j->user, "Job %d (attempt %d) moved back to QUEUED; it resumes from checkpoint #%d.",
+                        j->id, j->attempts, j->ckpt_num);
+        else
+            notify_user(j->user, "Job %d (attempt %d) moved back to QUEUED.", j->id, j->attempts);
     }
     g_sched_dirty = 1;
 }
@@ -276,6 +281,13 @@ void job_render_status(job_t *j, buf_t *out)
         bprintf(out, "  - Page Faults: %ld\n", j->page_faults);
         bprintf(out, "  - CPU Time: %.1fs\n", j->cpu_s);
     }
+    if (j->ckpt)
+        bprintf(out, "  - Checkpoint: #%d, %zu bytes, %.1fs old\n", j->ckpt_num, j->ckpt_len,
+                (double)(now - j->ckpt_ms) / 1000.0);
+    else
+        bprintf(out, "  - Checkpoint: none\n");
+    if (j->migrating)
+        bprintf(out, "  - Migrating: waiting for it to stop on Worker %d\n", j->worker_id);
     if (j->reason[0])
         bprintf(out, "  - Reason: %s\n", j->reason);
     bprintf(out, "  - Output: %zu bytes\n", j->out_total);
